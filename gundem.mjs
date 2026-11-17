@@ -255,29 +255,39 @@ async function main() {
   const state = await loadState();
   if (!hasAuth) console.log('UYARI: X çerezleri yok; tweet, kategori ve haber çekilmeyecek.');
 
-  // 1. Bölge trend listeleri.
+  // 1. Bölge trend listeleri. Cloudflare Actions'tan gelen bir isteği ara ara reddediyor (403); düşen bölgeler turun sonunda bir kez daha denenir.
+  const lists = new Map(), errors = new Map();
+  for (const attempt of [1, 2]) {
+    const todo = regions.filter(r => !lists.has(r.slug));
+    if (!todo.length) break;
+    if (attempt > 1) await sleep(5_000);
+    for (const region of todo) {
+      try { lists.set(region.slug, await fetchTrends(region)); } catch (e) { errors.set(region.slug, e.message); }
+      await sleep(500);
+    }
+  }
   const current = new Map();   // slug -> isimler (sıralı)
   for (const region of regions) {
     const prev = state.regions[region.slug] ?? { at: 0, trends: {} };
-    try {
-      const { at, names } = await fetchTrends(region);
-      const trends = {};
-      for (const [key, seen] of Object.entries(prev.trends)) trends[key] = { ...seen, rank: null };
-      let fresh = 0;
-      names.forEach((name, i) => {
-        const key = keyOf(name), old = trends[key];
-        if (!old) fresh++;
-        trends[key] = { name, firstSeen: old?.firstSeen ?? now, lastSeen: now, rank: i + 1, best: Math.min(old?.best ?? Infinity, i + 1) };
-      });
-      state.regions[region.slug] = { at, trends };
-      current.set(region.slug, names);
-      console.log(`${region.name}: ${names.length} trend, ${fresh} yeni (trends24 ${time(at)}).`);
-    } catch (e) {
-      console.log(`${region.name}: trend listesi alınamadı (${e.message}); önceki liste yerinde kalıyor.`);
+    const list = lists.get(region.slug);
+    if (!list) {
+      console.log(`${region.name}: trend listesi alınamadı (${errors.get(region.slug)}); önceki liste yerinde kalıyor.`);
       state.regions[region.slug] = prev;
       current.set(region.slug, Object.values(prev.trends).filter(t => t.rank != null).sort((a, b) => a.rank - b.rank).map(t => t.name));
+      continue;
     }
-    await sleep(500);
+    const { at, names } = list;
+    const trends = {};
+    for (const [key, seen] of Object.entries(prev.trends)) trends[key] = { ...seen, rank: null };
+    let fresh = 0;
+    names.forEach((name, i) => {
+      const key = keyOf(name), old = trends[key];
+      if (!old) fresh++;
+      trends[key] = { name, firstSeen: old?.firstSeen ?? now, lastSeen: now, rank: i + 1, best: Math.min(old?.best ?? Infinity, i + 1) };
+    });
+    state.regions[region.slug] = { at, trends };
+    current.set(region.slug, names);
+    console.log(`${region.name}: ${names.length} trend, ${fresh} yeni (trends24 ${time(at)}).`);
   }
   if (![...current.values()].some(n => n.length)) throw new Error('Hiçbir bölgenin trend listesi yok; yayın yapılmadı.');
 
