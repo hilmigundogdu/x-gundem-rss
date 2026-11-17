@@ -1,14 +1,16 @@
 #!/usr/bin/env node
-// X (Twitter) trendlerini bölge bölge RSS 2.0 beslemelerine çevirir; her trend öğesinde o konunun en beğenilen tweet'leri vardır.
-// Trend listesi trends24.in'den alınır (X'in bölge trendlerini saatlik yayımlar; kimlik istemez). Tweet'ler, X'in gündem haberleri
-// (haberler.xml) ve trendlerin X'teki kategorisi bird CLI'yla (@steipete/bird, X'in web GraphQL'i, oturum çerezi) çekilir (Node 22).
+// X (Twitter) trendlerini bölge bölge RSS 2.0 beslemelerine çevirir (Node 22). Her trend öğesinde o ülkenin dilinde son 24 saatin
+// haberleri vardır; haber bulunamayan trendde (çoğunlukla etiket kampanyaları) en beğenilen tweet'ler gösterilir.
+// Trend listesi trends24.in'den (X'in bölge trendlerini saatlik yayımlar; kimlik istemez), haberler Google News'in arama RSS'inden
+// gelir. Tweet'ler, X'in haber sayfaları (haberler.xml) ve trend kategorileri bird CLI'yla (@steipete/bird, X'in web GraphQL'i,
+// oturum çerezi) çekilir.
 //
-// Ortam:  BASE_URL     yayımlanmış sitenin adresi; önceki durum BASE_URL/state.json'dan okunur (ilk görülme anları, çekilmiş tweet'ler).
+// Ortam:  BASE_URL     yayımlanmış sitenin adresi; önceki durum BASE_URL/state.json'dan okunur (ilk görülme anları, haberler, tweet'ler).
 //         OUT_DIR      çıktı klasörü (varsayılan: public).
 //         AUTH_TOKEN, CT0   X oturum çerezleri (bird okur; yerelde BIRD_AUTH_TOKEN ve BIRD_CT0 de olur). Yoksa tweet, kategori ve
-//                      haber çekilmez; trend listeleri yine yayımlanır, önceki tweet'ler korunur.
+//                      X haberi çekilmez; trend listeleri ve Google News haberleri yine yayımlanır.
 //         BIRD         bird komutu (varsayılan: bird).
-// Yerel deneme:  node gundem.mjs [--prev eski/state.json] [--out klasor] [--budget 5] [--regions turkiye,abd]
+// Yerel deneme:  node gundem.mjs [--prev eski/state.json] [--out klasor] [--budget 5] [--press-budget 10] [--regions turkiye,abd]
 
 import { spawn } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -19,55 +21,68 @@ import { parseArgs } from 'node:util';
 const REPO = 'https://github.com/hilmigundogdu/x-gundem-rss';
 const USER_AGENT = `x-gundem-rss/1.0 (+${REPO})`;
 const TRENDS24 = 'https://trends24.in/';
+const GNEWS = 'https://news.google.com/rss/search';
 const HOUR = 60 * 60 * 1000, DAY = 24 * HOUR;
 const TOP = 10;                             // bölge başına beslemeye giren trend
-const TWEETS = 5;                           // trend öğesindeki tweet
-const MIN_TWEETS = 3;                       // ilk aramadan bundan az tweet gelirse dil süzgeci kalkar, beğeni eşiği onda birine iner
-const SEARCH_BUDGET = 40;                   // bir çalışmadaki en çok arama (X'in arama sınırı hesap başına 15 dakikada ~50)
+const PRESS_ITEMS = 3;                      // trend öğesindeki haber
+const PRESS_BUDGET = 100;                   // bir çalışmadaki en çok Google News isteği
+const PRESS_GAP_MS = 1_000;                 // Google News istekleri arasındaki en kısa ara
+const PRESS_REFRESH_MS = 2 * HOUR;          // gündemde kalan trendin haberleri en çok bu sıklıkla yenilenir
+const TWEETS = 3;                           // haber bulunamayan trend öğesindeki tweet
+const SEARCH_BUDGET = 30;                   // bir çalışmadaki en çok X araması (X'in arama sınırı hesap başına 15 dakikada ~50)
 const SEARCH_GAP_MS = 2_000;                // aramalar arasındaki en kısa ara
 const REFRESH_MS = 3 * HOUR;                // gündemde kalan trendin tweet'leri en çok bu sıklıkla yenilenir
 const RETRY_MS = HOUR;                      // tweet bulunamayan trend bu süre sonra yeniden aranır
+const WINDOW_MS = DAY;                      // haber ve tweet'ler bu kadar yeni olmalı
 const KEEP_MS = DAY;                        // gündemden düşen trend son görülmesinden sonra bu kadar süre beslemede kalır
 const MAX_ITEMS = 40;                       // bölge beslemesindeki en çok öğe
-const NEWS_KEEP_MS = 3 * DAY;               // gündem haberi son görülmesinden sonra bu kadar süre kalır
+const STORY_KEEP_MS = 3 * DAY;              // X haberi son görülmesinden sonra bu kadar süre kalır
+const STORY_MATCH_MS = 6 * HOUR;            // trend öğesine yalnız bu kadar yakın zamanda görülmüş X haberi bağlanır
 const FETCH_TIMEOUT_MS = 30_000;
 const BIRD_TIMEOUT_MS = 90_000;
 
-// faves: ilk aramadaki beğeni eşiği; lang: X'in dil süzgeci (Dünya'da yok).
+// faves: ilk tweet aramasındaki beğeni eşiği; lang: X'in dil süzgeci (Dünya'da yok); news: Google News'in ülke ve dil parametreleri.
 const REGIONS = [
-  { slug: 'dunya', name: 'Dünya', where: 'Dünyada', path: '', lang: null, faves: 500 },
-  { slug: 'abd', name: 'ABD', where: "ABD'de", path: 'united-states/', lang: 'en', faves: 500 },
-  { slug: 'turkiye', name: 'Türkiye', where: "Türkiye'de", path: 'turkey/', lang: 'tr', faves: 100 },
-  { slug: 'birlesik-krallik', name: 'Birleşik Krallık', where: "Birleşik Krallık'ta", path: 'united-kingdom/', lang: 'en', faves: 200 },
-  { slug: 'almanya', name: 'Almanya', where: "Almanya'da", path: 'germany/', lang: 'de', faves: 100 },
-  { slug: 'fransa', name: 'Fransa', where: "Fransa'da", path: 'france/', lang: 'fr', faves: 100 },
-  { slug: 'ispanya', name: 'İspanya', where: "İspanya'da", path: 'spain/', lang: 'es', faves: 100 },
-  { slug: 'italya', name: 'İtalya', where: "İtalya'da", path: 'italy/', lang: 'it', faves: 100 },
-  { slug: 'hollanda', name: 'Hollanda', where: "Hollanda'da", path: 'netherlands/', lang: 'nl', faves: 50 },
+  { slug: 'dunya', name: 'Dünya', where: 'Dünyada', path: '', lang: null, faves: 500, news: 'hl=en-US&gl=US&ceid=US:en' },
+  { slug: 'abd', name: 'ABD', where: "ABD'de", path: 'united-states/', lang: 'en', faves: 500, news: 'hl=en-US&gl=US&ceid=US:en' },
+  { slug: 'turkiye', name: 'Türkiye', where: "Türkiye'de", path: 'turkey/', lang: 'tr', faves: 100, news: 'hl=tr&gl=TR&ceid=TR:tr' },
+  { slug: 'birlesik-krallik', name: 'Birleşik Krallık', where: "Birleşik Krallık'ta", path: 'united-kingdom/', lang: 'en', faves: 200, news: 'hl=en-GB&gl=GB&ceid=GB:en' },
+  { slug: 'almanya', name: 'Almanya', where: "Almanya'da", path: 'germany/', lang: 'de', faves: 100, news: 'hl=de&gl=DE&ceid=DE:de' },
+  { slug: 'fransa', name: 'Fransa', where: "Fransa'da", path: 'france/', lang: 'fr', faves: 100, news: 'hl=fr&gl=FR&ceid=FR:fr' },
+  { slug: 'ispanya', name: 'İspanya', where: "İspanya'da", path: 'spain/', lang: 'es', faves: 100, news: 'hl=es&gl=ES&ceid=ES:es' },
+  { slug: 'italya', name: 'İtalya', where: "İtalya'da", path: 'italy/', lang: 'it', faves: 100, news: 'hl=it&gl=IT&ceid=IT:it' },
+  { slug: 'hollanda', name: 'Hollanda', where: "Hollanda'da", path: 'netherlands/', lang: 'nl', faves: 50, news: 'hl=nl&gl=NL&ceid=NL:nl' },
 ];
 
 const { values: args } = parseArgs({ options: {
-  prev: { type: 'string' }, out: { type: 'string' }, budget: { type: 'string' }, regions: { type: 'string' },
+  prev: { type: 'string' }, out: { type: 'string' }, budget: { type: 'string' }, 'press-budget': { type: 'string' }, regions: { type: 'string' },
 } });
 const baseUrl = (process.env.BASE_URL || '').replace(/\/?$/, '/');
 const outDir = args.out || process.env.OUT_DIR || 'public';
 const budget = args.budget ? Number(args.budget) : SEARCH_BUDGET;
+const pressBudget = args['press-budget'] ? Number(args['press-budget']) : PRESS_BUDGET;
 const regions = args.regions ? REGIONS.filter(r => args.regions.split(',').includes(r.slug)) : REGIONS;
-if (!regions.length || !(budget >= 0)) { console.error('HATA: --regions ya da --budget geçersiz.'); process.exit(2); }
+if (!regions.length || !(budget >= 0) || !(pressBudget >= 0)) { console.error('HATA: --regions, --budget ya da --press-budget geçersiz.'); process.exit(2); }
 const BIRD = process.env.BIRD || 'bird';
 const auth = { AUTH_TOKEN: process.env.AUTH_TOKEN || process.env.BIRD_AUTH_TOKEN || '', CT0: process.env.CT0 || process.env.BIRD_CT0 || '' };
 const hasAuth = Boolean(auth.AUTH_TOKEN && auth.CT0);
 
 // ---- Yardımcılar
 
-const ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', '#39': "'" };
+const ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
 const decode = s => s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (all, e) => e[0] !== '#' ? ENTITIES[e.toLowerCase()] ?? all
   : String.fromCodePoint(e[1].toLowerCase() === 'x' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10)));
 const INVALID_XML = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g;
 const esc = s => String(s).replace(INVALID_XML, '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const cdata = s => `<![CDATA[${String(s).replace(INVALID_XML, '').replace(/]]>/g, ']]]]><![CDATA[>')}]]>`;
 const keyOf = name => name.normalize('NFC').toLowerCase();
+// Karşılaştırma biçimi: küçük harf, # ve boşluksuz ("#TuzluKahve" ile "Tuzlu Kahve" aynı olur).
+const squash = s => s.normalize('NFC').toLowerCase().replace(/[#\s_]+/g, '');
+// Etiketin okunur biçimi: "#TheGameAwards" → "The Game Awards".
+const words = name => name.replace(/^#/, '').replace(/([\p{Ll}\d])(\p{Lu})/gu, '$1 $2').replace(/(\p{L})(\d)/gu, '$1 $2').trim();
+const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const searchUrl = name => `https://x.com/search?q=${encodeURIComponent(name)}&src=trend_click`;
+const storyUrl = id => `https://x.com/i/trending/${id}`;
 const tweetUrl = t => `https://x.com/${t.user}/status/${t.id}`;
 const number = n => new Intl.NumberFormat('tr-TR').format(n ?? 0);
 const compact = n => new Intl.NumberFormat('tr-TR', { notation: 'compact', maximumFractionDigits: 1 }).format(n);
@@ -107,30 +122,54 @@ function bird(argv) {
 }
 const rateLimited = e => /\b429\b|rate.?limit/i.test(e.message);
 
-// ---- Durum: önceki çalışmanın state.json'u; ilk görülme anlarını ve çekilmiş tweet'leri taşır.
-
-const emptyState = () => ({ version: 1, regions: {}, tweets: {}, context: {}, news: {} });
-
-async function loadState() {
-  if (args.prev) return { ...emptyState(), ...JSON.parse(await readFile(args.prev, 'utf8')) };
-  if (!process.env.BASE_URL) { console.log('BASE_URL yok; sıfırdan başlanıyor.'); return emptyState(); }
-  const res = await get(`${baseUrl}state.json?t=${Date.now()}`);
-  if (res.status === 404) { console.log('Önceki durum yok; sıfırdan başlanıyor.'); return emptyState(); }
-  if (!res.ok) throw new Error(`Önceki durum okunamadı (HTTP ${res.status}); ilk görülme anları kaybolmasın diye yayın yapılmadı.`);
-  return { ...emptyState(), ...JSON.parse(res.body) };
+// Sırayla giden, aralarında en az gap olan ve bütçesi biten istek kuyruğu.
+function limiter(max, gap) {
+  const self = { used: 0, async run(call) {
+    if (self.used >= max) throw Object.assign(new Error('bütçe bitti'), { budget: true });
+    if (self.used) await sleep(gap);
+    self.used++;
+    return call();
+  } };
+  return self;
 }
 
-// ---- trends24: sayfadaki ilk liste en son anlık görüntüdür (saatlik).
+// ---- Durum: önceki çalışmanın state.json'u; ilk görülme anlarını, haberleri ve tweet'leri taşır.
+// regions[slug].trends[anahtar], press["slug:anahtar"], tweets[anahtar], context[anahtar], stories[id] (X haberleri).
+
+const emptyState = () => ({ version: 2, regions: {}, press: {}, tweets: {}, context: {}, stories: {} });
+
+async function loadState() {
+  let raw;
+  if (args.prev) raw = JSON.parse(await readFile(args.prev, 'utf8'));
+  else if (!process.env.BASE_URL) { console.log('BASE_URL yok; sıfırdan başlanıyor.'); return emptyState(); }
+  else {
+    const res = await get(`${baseUrl}state.json?t=${Date.now()}`);
+    if (res.status === 404) { console.log('Önceki durum yok; sıfırdan başlanıyor.'); return emptyState(); }
+    if (!res.ok) throw new Error(`Önceki durum okunamadı (HTTP ${res.status}); ilk görülme anları kaybolmasın diye yayın yapılmadı.`);
+    raw = JSON.parse(res.body);
+  }
+  // Sürüm 1'de X haberleri "news" adındaydı, kategoriler süzülmeden yazılıyordu.
+  if (raw.version === 1) { raw.stories = raw.news ?? {}; delete raw.news; raw.version = 2; }
+  const state = { ...emptyState(), ...raw };
+  for (const [key, c] of Object.entries(state.context)) {
+    c.category = cleanCategory(c.category);
+    if (!c.category && !c.description) delete state.context[key];
+  }
+  return state;
+}
+
+// ---- trends24: sayfadaki ilk liste en son anlık görüntüdür (saatlik). İlk TOP trend beslemeye girer; listenin tamamı
+// trend sörfü süzgecinde kullanılır.
 
 function parseTrends24(html) {
   const head = /class=["']?title["']? data-timestamp=["']?([\d.]+)/.exec(html);
   const start = html.indexOf('trend-card__list', head?.index ?? 0);
   const end = html.indexOf('</ol>', start);
   if (!head || start < 0 || end < 0) throw new Error('trends24 sayfasında trend listesi bulunamadı.');
-  const names = [...html.slice(start, end).matchAll(/<a\b[^>]*class=["']?trend-link["']?[^>]*>([^<]+)<\/a>/g)]
-    .map(m => decode(m[1]).replace(/\s+/g, ' ').trim()).filter(Boolean);
-  if (!names.length) throw new Error('trends24 listesi boş.');
-  return { at: Math.round(parseFloat(head[1]) * 1000), names: [...new Set(names)].slice(0, TOP) };
+  const all = [...new Set([...html.slice(start, end).matchAll(/<a\b[^>]*class=["']?trend-link["']?[^>]*>([^<]+)<\/a>/g)]
+    .map(m => decode(m[1]).replace(/\s+/g, ' ').trim()).filter(Boolean))];
+  if (!all.length) throw new Error('trends24 listesi boş.');
+  return { at: Math.round(parseFloat(head[1]) * 1000), names: all.slice(0, TOP), all };
 }
 
 async function fetchTrends(region) {
@@ -139,14 +178,31 @@ async function fetchTrends(region) {
   return parseTrends24(res.body);
 }
 
-// ---- Tweet'ler: X'in "Latest" araması (bird "Top"u desteklemiyor) son TWEET_WINDOW_MS ve beğeni eşiğiyle süzülür, en beğenilenler alınır.
-// Süre süzgeci olmasa yüksek eşikte günler önceki tweet'ler gelir.
+// ---- Haberler: Google News'in arama RSS'i, bölgenin ülkesi ve diliyle, son 24 saat. Etiket okunur biçimiyle aranır.
 
-const TWEET_WINDOW_MS = DAY;
+async function fetchPress(name, region) {
+  const query = `"${words(name).replace(/"/g, '')}" when:1d`;
+  const res = await get(`${GNEWS}?q=${encodeURIComponent(query)}&${region.news}`);
+  if (!res.ok) throw Object.assign(new Error(`Google News HTTP ${res.status}`), { stop: res.status === 429 || res.status >= 500 });
+  const seen = new Set(), list = [];
+  for (const [, item] of res.body.matchAll(/<item>([\s\S]*?)<\/item>/g)) {
+    const field = tag => decode(new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)</${tag}>`).exec(item)?.[1] ?? '').trim();
+    const source = field('source'), url = field('link'), at = Date.parse(field('pubDate')) || null;
+    let title = field('title');
+    if (source && title.endsWith(` - ${source}`)) title = title.slice(0, -source.length - 3).trim();
+    if (!title || !url || seen.has(title.toLowerCase()) || (at && Date.now() - at > WINDOW_MS)) continue;
+    seen.add(title.toLowerCase());
+    list.push({ title, source, url, at });
+    if (list.length >= PRESS_ITEMS) break;
+  }
+  return list;
+}
+
+// ---- Tweet'ler: X'in "Latest" araması (bird "Top"u desteklemiyor) son 24 saat ve beğeni eşiğiyle süzülür, en beğenilenler alınır.
 
 function searchQuery(name, lang, faves) {
   const q = /^[#$]\S+$/.test(name) ? name : `"${name.replace(/"/g, '')}"`;
-  const since = `since_time:${Math.floor((Date.now() - TWEET_WINDOW_MS) / 1000)}`;
+  const since = `since_time:${Math.floor((Date.now() - WINDOW_MS) / 1000)}`;
   return [q, lang && `lang:${lang}`, `min_faves:${faves}`, since, '-filter:retweets', '-filter:replies'].filter(Boolean).join(' ');
 }
 
@@ -160,25 +216,68 @@ function slim(t) {
   };
 }
 
-async function searchTweets(name, lang, faves, use) {
-  const found = new Map();
-  const run = async query => {
-    const list = await use(() => bird(['search', query, '-n', '20', '--json']));
-    for (const t of Array.isArray(list) ? list : list?.tweets ?? []) if (t?.id && !found.has(String(t.id))) found.set(String(t.id), slim(t));
-  };
-  await run(searchQuery(name, lang, faves));
-  // Gevşek arama bütçeye sığmazsa ilk aramanın sonucu yine kullanılır.
-  if (found.size < MIN_TWEETS) await run(searchQuery(name, null, Math.max(1, Math.round(faves / 10)))).catch(e => { if (!e.budget || !found.size) throw e; });
-  return [...found.values()].sort((a, b) => b.likes - a.likes).slice(0, TWEETS);
+// Trend sörfü: görünürlük için o anki trendleri dizen tweet. Bir satır yalnız trend adlarından, etiketlerden ve bağlantılardan
+// oluşuyorsa "etiket satırı"dır. Aranan trend düz yazıda geçmiyor ve etiket satırlarında başka trendler de diziliyse
+// (düz adda en az 2, etikette en az 3) tweet konu dışıdır. Kardeş trendler sayılmaz: arama sonuçlarının en az yarısında geçen
+// trendler aynı konuşmanın parçasıdır (bir kampanyanın etiketleri birlikte kullanılır; sörfle gelen etiketler sonuçların ~%30'unda kalır).
+const SIBLING_SHARE = 0.5;
+function siblingsOf(tweets, target, names) {
+  if (tweets.length < 3) return [];
+  const own = squash(target), texts = tweets.map(t => t.text.normalize('NFC').toLowerCase());
+  return names.filter(n => squash(n) !== own && texts.filter(x => x.includes(n)).length >= tweets.length * SIBLING_SHARE);
 }
 
-// ---- X'in kendi bağlamı: oturum hesabının konumundaki (Türkiye) trend sekmesinin kategorileri.
+function trendSurfing(text, target, names, siblings = []) {
+  const own = squash(target), kin = new Set(siblings.map(squash));
+  let others = 0, ownInProse = false;
+  for (const line of text.split('\n')) {
+    let rest = ` ${line.replace(/https?:\/\/\S+/g, ' ').normalize('NFC').toLowerCase()} `;
+    const hits = [];
+    for (const n of names) if (rest.includes(n)) { hits.push(n); rest = rest.split(n).join(' '); }
+    const tagLine = hits.length > 0 && !rest.replace(/[#@][^\s#@]+/g, ' ').replace(/[\s\p{P}\p{S}]+/gu, '');
+    if (!tagLine && squash(line).includes(own)) ownInProse = true;
+    if (tagLine) others += hits.filter(n => squash(n) !== own && !kin.has(squash(n))).length;
+  }
+  return !ownInProse && others >= (target.startsWith('#') ? 3 : 2);
+}
+
+async function searchTweets(name, region, names, queue) {
+  const found = new Map();
+  let siblings = [];
+  const clean = () => {
+    siblings = siblingsOf([...found.values()], name, names);
+    return [...found.values()].filter(t => !trendSurfing(t.text, name, names, siblings));
+  };
+  const run = async query => {
+    const list = await queue.run(() => bird(['search', query, '-n', '20', '--json']));
+    for (const t of Array.isArray(list) ? list : list?.tweets ?? []) if (t?.id && !found.has(String(t.id))) found.set(String(t.id), slim(t));
+  };
+  await run(searchQuery(name, region.lang, region.faves));
+  // Az tweet kalırsa dil süzgeci kalkar, eşik onda birine iner; gevşek arama bütçeye sığmazsa ilk aramanın sonucu yine kullanılır.
+  if (clean().length < TWEETS) await run(searchQuery(name, null, Math.max(1, Math.round(region.faves / 10)))).catch(e => { if (!e.budget || !found.size) throw e; });
+  const list = clean().sort((a, b) => b.likes - a.likes).slice(0, TWEETS);
+  return { at: Date.now(), name, siblings, list };
+}
+
+// ---- X'in kendi bağlamı: Keşfet sekmelerindeki trendlerin kategorisi ve X'in habere çevirdiği konular (x.com/i/trending/<id>).
+// İkisi de oturum hesabının konumuna göre gelir.
+
+// "Trending", "Trending in Turkey", "Trending worldwide", "Only on X" kategori değil; "Politics · Trending" → "Politics".
+const cleanCategory = c => (c ?? '').split(' · ').map(s => s.trim()).filter(s => s && !/^(Trending\b.*|Only on X)$/i.test(s)).join(' · ');
 
 function contextOf(item) {
   if (/promoted_trend/.test(item.url ?? item.id ?? '')) return null;   // reklamlı trend
-  const category = (item.category ?? '').replace(/\s*·\s*Trending$/, '').replace(/^Trending( in .*)?$/, '').trim();
-  const description = (item.description ?? '').trim();
+  const category = cleanCategory(item.category), description = (item.description ?? '').trim();
   return category || description ? { category, description } : null;
+}
+
+// Trend adı (etiketse okunur biçimi) bir X haberinin başlığında tam söz olarak geçiyorsa o haber trende bağlanır.
+function storyFor(name, stories, now) {
+  const phrase = words(name).toLowerCase();
+  if (phrase.length < 3) return null;
+  const re = new RegExp(`(^|[^\\p{L}\\p{N}])${escapeRe(phrase)}($|[^\\p{L}\\p{N}])`, 'u');
+  return Object.entries(stories).filter(([, s]) => now - s.lastSeen <= STORY_MATCH_MS && re.test(s.headline.toLowerCase()))
+    .sort(([, a], [, b]) => b.lastSeen - a.lastSeen || (b.postCount ?? 0) - (a.postCount ?? 0)).map(([id, s]) => ({ id, ...s }))[0] ?? null;
 }
 
 // ---- RSS
@@ -193,16 +292,27 @@ function renderTweet(t) {
     + `<a href="${esc(tweetUrl(t))}">${t.at ? time(t.at) : 'tweet'}</a></p>`;
 }
 
-function trendItem(region, name, seen, tweets, context, now) {
-  // Okuyucular özeti ilk satırlardan çıkardığı için önce bağlam ve tweet'ler, sıra bilgisi en sonda.
-  const lines = [];
+// Okuyucular özeti ilk satırlardan çıkardığı için önce bağlam, X haberi ve haberler; tweet'ler yalnız haber yoksa; sıra bilgisi en sonda.
+function trendItem(region, seen, { press, tweets, context, story, names }) {
+  const name = seen.name, lines = [];
   if (context) lines.push(`<p><b>${esc(context.category || 'X')}</b>${context.description ? ` — ${esc(context.description)}` : ''}</p>`);
-  if (tweets?.list.length) lines.push(...tweets.list.map(renderTweet));
-  else lines.push(tweets ? '<p>Son 24 saatte beğeni eşiğini geçen tweet bulunamadı.</p>' : '<p>Tweet\'ler henüz çekilmedi.</p>');
-  lines.push(seen.rank != null
-    ? `<p><small>${esc(region.where)} ${seen.rank}. sırada · ilk görülme ${time(seen.firstSeen)}`
-    : `<p><small>${esc(region.where)} gündemden düştü · son görülme ${time(seen.lastSeen)}, en iyi sıra ${seen.best}.`);
-  lines[lines.length - 1] += `${tweets?.list.length ? ` · tweet'ler ${time(tweets.at)} itibarıyla` : ''} · <a href="${esc(searchUrl(name))}">X'te ara</a></small></p>`;
+  if (story) {
+    lines.push(`<p><b>X'te:</b> <a href="${storyUrl(story.id)}">${esc(story.headline)}</a>${story.postCount ? ` · ${compact(story.postCount)} gönderi` : ''}</p>`);
+    if (story.image) lines.push(`<p><a href="${storyUrl(story.id)}"><img src="${esc(story.image)}" alt=""></a></p>`);
+  }
+  let note = '';
+  if (press?.list.length) {
+    lines.push(`<ul>\n${press.list.map(n => `<li><a href="${esc(n.url)}">${esc(n.title)}</a> — ${esc(n.source || 'haber')}${n.at ? ` · ${time(n.at)}` : ''}</li>`).join('\n')}\n</ul>`);
+    note = ` · haberler ${time(press.at)} itibarıyla`;
+  } else {
+    const list = (tweets?.list ?? []).filter(t => !trendSurfing(t.text, name, names, tweets.siblings)).slice(0, TWEETS);
+    if (list.length) { lines.push(...list.map(renderTweet)); note = ` · tweet'ler ${time(tweets.at)} itibarıyla`; }
+    else if (!press) lines.push('<p>Haberler henüz çekilmedi.</p>');
+    else if (!tweets) lines.push('<p>Son 24 saatte haber yok; tweet\'ler henüz çekilmedi.</p>');
+    else lines.push('<p>Son 24 saatte bu konuda haber de beğeni eşiğini geçen tweet de bulunamadı.</p>');
+  }
+  lines.push(`<p><small>${esc(region.where)} ${seen.rank != null ? `${seen.rank}. sırada · ilk görülme ${time(seen.firstSeen)}`
+    : `gündemden düştü · son görülme ${time(seen.lastSeen)}, en iyi sıra ${seen.best}.`}${note} · <a href="${esc(searchUrl(name))}">X'te ara</a></small></p>`);
   return {
     title: name, link: searchUrl(name), guid: `x-gundem:${region.slug}:${keyOf(name)}`, date: seen.firstSeen,
     categories: [region.name, ...(context?.category ? [context.category] : [])], description: lines.join('\n'),
@@ -241,7 +351,7 @@ function render(channel, items, now) {
 function indexHtml(files, now) {
   const rows = files.map(f => `<li><a href="${esc(f.file)}">${esc(f.title)}</a></li>`).join('\n');
   return `<!doctype html><meta charset="utf-8"><title>X gündem RSS</title>
-<h1>X gündem RSS</h1><p>X trendleri bölge bölge, en beğenilen tweet'leriyle. Son üretim: ${time(now)} (İstanbul). <a href="${REPO}">Kaynak</a></p>
+<h1>X gündem RSS</h1><p>X trendleri bölge bölge, son 24 saatin haberleriyle. Son üretim: ${time(now)} (İstanbul). <a href="${REPO}">Kaynak</a></p>
 <ul>
 ${rows}
 </ul>
@@ -253,7 +363,7 @@ ${rows}
 async function main() {
   const now = Date.now();
   const state = await loadState();
-  if (!hasAuth) console.log('UYARI: X çerezleri yok; tweet, kategori ve haber çekilmeyecek.');
+  if (!hasAuth) console.log('UYARI: X çerezleri yok; tweet, kategori ve X haberi çekilmeyecek.');
 
   // 1. Bölge trend listeleri. Cloudflare Actions'tan gelen bir isteği ara ara reddediyor (403); düşen bölgeler turun sonunda bir kez daha denenir.
   const lists = new Map(), errors = new Map();
@@ -266,17 +376,21 @@ async function main() {
       await sleep(500);
     }
   }
-  const current = new Map();   // slug -> isimler (sıralı)
+  const current = new Map();   // slug -> beslemeye giren isimler (sıralı)
+  const everyName = new Set(); // süzgeç için tüm bölgelerin tam listeleri
   for (const region of regions) {
     const prev = state.regions[region.slug] ?? { at: 0, trends: {} };
     const list = lists.get(region.slug);
     if (!list) {
       console.log(`${region.name}: trend listesi alınamadı (${errors.get(region.slug)}); önceki liste yerinde kalıyor.`);
       state.regions[region.slug] = prev;
-      current.set(region.slug, Object.values(prev.trends).filter(t => t.rank != null).sort((a, b) => a.rank - b.rank).map(t => t.name));
+      const names = Object.values(prev.trends).filter(t => t.rank != null).sort((a, b) => a.rank - b.rank).map(t => t.name);
+      current.set(region.slug, names);
+      names.forEach(n => everyName.add(n));
       continue;
     }
-    const { at, names } = list;
+    const { at, names, all } = list;
+    all.forEach(n => everyName.add(n));
     const trends = {};
     for (const [key, seen] of Object.entries(prev.trends)) trends[key] = { ...seen, rank: null };
     let fresh = 0;
@@ -290,6 +404,9 @@ async function main() {
     console.log(`${region.name}: ${names.length} trend, ${fresh} yeni (trends24 ${time(at)}).`);
   }
   if (![...current.values()].some(n => n.length)) throw new Error('Hiçbir bölgenin trend listesi yok; yayın yapılmadı.');
+  for (const slug of Object.keys(state.regions)) for (const seen of Object.values(state.regions[slug].trends)) everyName.add(seen.name);
+  // Uzun adlar önce çıkarılsın ("Tuzlu Kahve 12" içinden "Tuzlu Kahve" değil); 3 harften kısa adlar süzgeçte kullanılmaz.
+  const names = [...everyName].map(n => n.normalize('NFC').toLowerCase()).filter(n => n.length >= 3).sort((a, b) => b.length - a.length);
 
   // Düşen ve süresi dolan trendler atılır.
   for (const slug of Object.keys(state.regions)) {
@@ -297,96 +414,127 @@ async function main() {
     for (const [key, seen] of Object.entries(trends)) if (seen.rank == null && now - seen.lastSeen > KEEP_MS) delete trends[key];
   }
 
+  // Saklı tweet'ler bu çalışmanın trend listesiyle yeniden süzülür; süzgece takılan çıkarsa trend yeniden aranır.
+  const nameOf = new Map(Object.values(state.regions).flatMap(r => Object.entries(r.trends).map(([key, seen]) => [key, seen.name])));
+  let dropped = 0;
+  for (const [key, entry] of Object.entries(state.tweets)) {
+    const name = entry.name ?? nameOf.get(key);
+    if (!name) continue;
+    entry.name = name;
+    entry.siblings ??= siblingsOf(entry.list, name, names);
+    const kept = entry.list.filter(t => !trendSurfing(t.text, name, names, entry.siblings));
+    if (kept.length < entry.list.length) { dropped += entry.list.length - kept.length; entry.list = kept; entry.at = 0; }
+  }
+  if (dropped) console.log(`Trend sörfü: saklı ${dropped} tweet çıkarıldı; o trendler yeniden aranacak.`);
+
+  // 2. Haberler: önce hiç çekilmemiş trendler (iyi sıradan başlayarak), sonra yenilenmesi gelenler.
+  const pressDue = regions.flatMap(region => (current.get(region.slug) ?? []).map((name, i) => ({ region, name, rank: i + 1, id: `${region.slug}:${keyOf(name)}` })))
+    .filter(({ id }) => !state.press[id] || now - state.press[id].at >= PRESS_REFRESH_MS)
+    .sort((a, b) => Number(Boolean(state.press[a.id])) - Number(Boolean(state.press[b.id])) || a.rank - b.rank);
+  const pressQueue = limiter(pressBudget, PRESS_GAP_MS);
+  let pressDone = 0, pressFound = 0;
+  for (const { region, name, id } of pressDue) {
+    try {
+      const list = await pressQueue.run(() => fetchPress(name, region));
+      state.press[id] = { at: Date.now(), list };
+      pressDone++; if (list.length) pressFound++;
+    } catch (e) {
+      if (e.budget) break;
+      console.log(`"${name}" (${region.name}) haberleri alınamadı: ${e.message}`);
+      if (e.stop) { console.log('Google News istekleri sonraki çalışmaya kaldı.'); break; }
+    }
+  }
+  console.log(`Haber: ${pressDone}/${pressDue.length} trend güncellendi, ${pressFound} trendde haber var, ${pressQueue.used}/${pressBudget} istek.`);
+
   if (hasAuth) {
-    // 2. X'in trend sekmesindeki kategori ve açıklamalar (oturum hesabının konumu).
+    // 3. X'in Keşfet sekmeleri: trend kategorileri ve X'in habere çevirdiği konular.
     try {
-      const list = await bird(['trending', '--trending-only', '-n', '30', '--json']);
-      let n = 0;
+      const list = await bird(['trending', '-n', '100', '--json-full']);
+      let contexts = 0, stories = 0;
       for (const item of list) {
-        const ctx = item.headline && contextOf(item);
-        if (ctx) { state.context[keyOf(item.headline)] = { ...ctx, at: now }; n++; }
-      }
-      console.log(`X trend sekmesi: ${list.length} trend, ${n} bağlam.`);
-    } catch (e) { console.log(`X trend sekmesi alınamadı: ${e.message}`); }
-
-    // 3. X'in gündem haberleri.
-    try {
-      const list = await bird(['news', '--news-only', '-n', '20', '--json-full']);
-      for (const item of list) {
+        if (!item.headline) continue;
         const id = /trending\/(\d+)/.exec(item.id ?? '')?.[1];
-        if (!id || !item.headline) continue;
-        const old = state.news[id];
-        state.news[id] = {
-          headline: item.headline, category: (item.category ?? '').replace(/^AI · /, ''), postCount: item.postCount ?? old?.postCount ?? null,
-          image: item._raw?.images?.[0]?.url ?? item._raw?.thumbnail_image?.original_img_url ?? old?.image ?? null,
-          firstSeen: old?.firstSeen ?? now, lastSeen: now,
-        };
+        if (id) {
+          const old = state.stories[id];
+          state.stories[id] = {
+            headline: item.headline, category: (item.category ?? '').replace(/^AI · /, ''), postCount: item.postCount ?? old?.postCount ?? null,
+            image: item._raw?.images?.[0]?.url ?? item._raw?.thumbnail_image?.original_img_url ?? old?.image ?? null,
+            firstSeen: old?.firstSeen ?? now, lastSeen: now,
+          };
+          stories++;
+          continue;
+        }
+        const ctx = contextOf(item);
+        if (ctx) { state.context[keyOf(item.headline)] = { ...ctx, at: now }; contexts++; }
       }
-      console.log(`X gündem haberleri: ${list.length}.`);
-    } catch (e) { console.log(`X gündem haberleri alınamadı: ${e.message}`); }
+      console.log(`X Keşfet: ${list.length} öğe, ${contexts} kategori, ${stories} haber.`);
+    } catch (e) { console.log(`X Keşfet alınamadı: ${e.message}`); }
 
-    // 4. Tweet'ler: önce hiç çekilmemiş trendler (iyi sıradan başlayarak), sonra yenilenmesi gelenler. Bölgeler arasında ortak trend bir kez aranır.
+    // 4. Tweet'ler yalnız haberi bulunamayan trendler için. Bölgeler arasında ortak trend bir kez aranır.
     const want = new Map();
     for (const region of regions) (current.get(region.slug) ?? []).forEach((name, i) => {
+      const press = state.press[`${region.slug}:${keyOf(name)}`];
+      if (!press || press.list.length) return;
       const key = keyOf(name), had = want.get(key);
       if (!had || i + 1 < had.rank) want.set(key, { name, region, rank: i + 1 });
     });
     const due = [...want].filter(([key]) => { const t = state.tweets[key]; return !t || now - t.at >= (t.list.length ? REFRESH_MS : RETRY_MS); })
       .sort(([ka, a], [kb, b]) => Number(Boolean(state.tweets[ka])) - Number(Boolean(state.tweets[kb])) || a.rank - b.rank);
-    let searches = 0, done = 0, stop = false;
-    const use = async call => {
-      if (searches >= budget) throw Object.assign(new Error('arama bütçesi bitti'), { budget: true });
-      if (searches) await sleep(SEARCH_GAP_MS);
-      searches++;
-      return call();
-    };
+    const queue = limiter(budget, SEARCH_GAP_MS);
+    let done = 0;
     for (const [key, { name, region }] of due) {
-      if (stop || searches >= budget) break;
       try {
-        state.tweets[key] = { at: Date.now(), list: await searchTweets(name, region.lang, region.faves, use) };
+        state.tweets[key] = await searchTweets(name, region, names, queue);
         done++;
       } catch (e) {
         if (e.budget) break;
         console.log(`"${name}" aranamadı: ${e.message}`);
-        if (rateLimited(e)) { console.log('X arama sınırına takıldı; aramalar sonraki çalışmaya kaldı.'); stop = true; }
+        if (rateLimited(e)) { console.log('X arama sınırına takıldı; aramalar sonraki çalışmaya kaldı.'); break; }
       }
     }
-    console.log(`Tweet: ${done}/${due.length} trend güncellendi, ${searches}/${budget} arama.`);
+    console.log(`Tweet: ${done}/${due.length} trend güncellendi, ${queue.used}/${budget} arama.`);
   }
 
-  // Artık hiçbir beslemede olmayan tweet, bağlam ve haberler atılır.
-  const live = new Set(Object.values(state.regions).flatMap(r => Object.keys(r.trends)));
-  for (const key of Object.keys(state.tweets)) if (!live.has(key)) delete state.tweets[key];
-  for (const [key, c] of Object.entries(state.context)) if (!live.has(key) && now - c.at > KEEP_MS) delete state.context[key];
-  for (const [id, n] of Object.entries(state.news)) if (now - n.lastSeen > NEWS_KEEP_MS) delete state.news[id];
+  // Artık hiçbir beslemede olmayan haber, tweet, kategori ve X haberleri atılır.
+  const live = new Set(Object.entries(state.regions).flatMap(([slug, r]) => Object.keys(r.trends).map(key => `${slug}:${key}`)));
+  const liveKeys = new Set([...live].map(id => id.slice(id.indexOf(':') + 1)));
+  for (const id of Object.keys(state.press)) if (!live.has(id)) delete state.press[id];
+  for (const key of Object.keys(state.tweets)) if (!liveKeys.has(key)) delete state.tweets[key];
+  for (const [key, c] of Object.entries(state.context)) if (!liveKeys.has(key) && now - c.at > KEEP_MS) delete state.context[key];
+  for (const [id, s] of Object.entries(state.stories)) if (now - s.lastSeen > STORY_KEEP_MS) delete state.stories[id];
 
   // 5. Yazma.
   await mkdir(outDir, { recursive: true });
   const files = [];
+  let linked = 0;
   for (const region of REGIONS) {
     const trends = state.regions[region.slug]?.trends;
     if (!trends) continue;
     const items = Object.entries(trends)
       .sort(([, a], [, b]) => (a.rank ?? Infinity) - (b.rank ?? Infinity) || b.lastSeen - a.lastSeen)
       .slice(0, MAX_ITEMS)
-      .map(([key, seen]) => trendItem(region, seen.name, seen, state.tweets[key], state.context[key], now));
+      .map(([key, seen]) => {
+        const story = storyFor(seen.name, state.stories, now);
+        if (story) linked++;
+        return trendItem(region, seen, { press: state.press[`${region.slug}:${key}`], tweets: state.tweets[key], context: state.context[key], story, names });
+      });
     const file = `${region.slug}.xml`, title = `X Trend · ${region.name}`;
     await writeFile(join(outDir, file), render({ file, title, link: `${TRENDS24}${region.path}`,
-      description: `${region.where} X trendleri (trends24.in), her birinde en beğenilen tweet'ler.` }, items, now));
+      description: `${region.where} X trendleri (trends24.in), son 24 saatin haberleriyle.` }, items, now));
     files.push({ file, title });
   }
-  const news = Object.entries(state.news).sort(([, a], [, b]) => b.lastSeen - a.lastSeen || b.firstSeen - a.firstSeen).map(([id, n]) => ({
-    title: n.headline, link: `https://x.com/i/trending/${id}`, guid: `x-gundem:haber:${id}`, date: n.firstSeen,
-    categories: ['X Gündem', ...(n.category ? [n.category] : [])],
-    description: [`<p>${esc(n.category || 'Haber')}${n.postCount ? ` · ${compact(n.postCount)} gönderi` : ''} · ilk görülme ${time(n.firstSeen)}`
-      + ` · <a href="https://x.com/i/trending/${id}">X'te aç</a></p>`, ...(n.image ? [`<p><img src="${esc(n.image)}" alt=""></p>`] : [])].join('\n'),
+  const stories = Object.entries(state.stories).sort(([, a], [, b]) => b.lastSeen - a.lastSeen || b.firstSeen - a.firstSeen).map(([id, s]) => ({
+    title: s.headline, link: storyUrl(id), guid: `x-gundem:haber:${id}`, date: s.firstSeen,
+    categories: ['X Gündem', ...(s.category ? [s.category] : [])],
+    description: [`<p>${esc(s.category || 'Haber')}${s.postCount ? ` · ${compact(s.postCount)} gönderi` : ''} · ilk görülme ${time(s.firstSeen)}`
+      + ` · <a href="${storyUrl(id)}">X'te aç</a></p>`, ...(s.image ? [`<p><img src="${esc(s.image)}" alt=""></p>`] : [])].join('\n'),
   }));
   await writeFile(join(outDir, 'haberler.xml'), render({ file: 'haberler.xml', title: 'X Gündem · Haberler', link: 'https://x.com/explore/tabs/news',
-    description: "X'in Keşfet'teki gündem haberleri (oturum hesabının konumuna göre)." }, news, now));
+    description: "X'in Keşfet sekmelerinde habere çevirdiği konular (oturum hesabının konumuna göre)." }, stories, now));
   files.push({ file: 'haberler.xml', title: 'X Gündem · Haberler' });
   await writeFile(join(outDir, 'state.json'), JSON.stringify(state));
   await writeFile(join(outDir, 'index.html'), indexHtml(files, now));
-  console.log(`Yazıldı: ${files.length} besleme → ${outDir}`);
+  console.log(`Yazıldı: ${files.length} besleme, ${linked} trende X haberi bağlandı → ${outDir}`);
 }
 
 main().catch(e => { console.error(`HATA: ${e.message}`); process.exit(1); });
