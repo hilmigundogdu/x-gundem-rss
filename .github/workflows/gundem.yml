@@ -1,0 +1,66 @@
+name: X gündem RSS
+
+# Yalnız zamanlayıcı ve elle tetikleme: pull request'le çalışmaz, böylece dışarıdan kimse sırları kullanan bir çalışma başlatamaz.
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # besleme
+    - cron: '41 3 * * *'     # günlük canlı tutma (60 gün etkinliksizlikte zamanlanmış iş kapanmasın)
+  workflow_dispatch:
+
+concurrency:
+  group: x-gundem
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event.schedule != '41 3 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: bird CLI
+        run: npm install -g --no-audit --no-fund @steipete/bird@0.8.0
+      - id: pages
+        uses: actions/configure-pages@v6
+      - name: Beslemeleri üret
+        run: node gundem.mjs
+        env:
+          BASE_URL: ${{ steps.pages.outputs.base_url }}/
+          OUT_DIR: public
+          # X oturum çerezleri; depo sırlarında durur, günlükte maskelenir, betik hiçbir yere yazmaz.
+          AUTH_TOKEN: ${{ secrets.X_AUTH_TOKEN }}
+          CT0: ${{ secrets.X_CT0 }}
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
+  keepalive:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '41 3 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Workflow'u etkin tut
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/gundem.yml/enable" && echo "Workflow etkin."
+        env:
+          GH_TOKEN: ${{ github.token }}
