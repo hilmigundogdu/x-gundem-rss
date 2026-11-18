@@ -2,16 +2,16 @@
 // X (Twitter) trendlerini bölge bölge RSS 2.0 beslemelerine çevirir (Node 22). Her trend öğesinde o ülkenin dilinde son 24 saatin
 // haberleri vardır; haber bulunamayan trendde (çoğunlukla etiket kampanyaları) en beğenilen tweet'ler gösterilir.
 // Trend listesi trends24.in'den (X'in bölge trendlerini saatlik yayımlar; kimlik istemez), haberler Google News'in arama RSS'inden
-// gelir; ülkenin haberleri İngilizce ya da Türkçe değilse aynı trend İngilizce haberlerde de aranır. Tweet'ler, X'in haber sayfaları (haberler.xml) ve trend kategorileri bird CLI'yla (@steipete/bird, X'in web GraphQL'i,
+// gelir (Google engellediğinde Bing News'in RSS'inden); ülkenin haberleri İngilizce ya da Türkçe değilse aynı trend İngilizce haberlerde de aranır. Tweet'ler, X'in haber sayfaları (haberler.xml) ve trend kategorileri bird CLI'yla (@steipete/bird, X'in web GraphQL'i,
 // oturum çerezi) çekilir. İngilizce ve Türkçe dışındaki trend adı, başlık ve tweet'lerin İngilizce ve Türkçe çevirisi öğenin
 // sonuna eklenir (Google Translate'in anahtarsız ucu; X'in "çevir" düğmesi de Google çevirisi gösterir).
 //
 // Ortam:  BASE_URL     yayımlanmış sitenin adresi; önceki durum BASE_URL/state.json'dan okunur (ilk görülme anları, haberler, tweet'ler, çeviriler).
 //         OUT_DIR      çıktı klasörü (varsayılan: public).
 //         AUTH_TOKEN, CT0   X oturum çerezleri (bird okur; yerelde BIRD_AUTH_TOKEN ve BIRD_CT0 de olur). Yoksa tweet, kategori ve
-//                      X haberi çekilmez; trend listeleri ve Google News haberleri yine yayımlanır.
+//                      X haberi çekilmez; trend listeleri ve haberler yine yayımlanır.
 //         BIRD         bird komutu (varsayılan: bird).
-// Yerel deneme:  node gundem.mjs [--prev eski/state.json] [--out klasor] [--budget 5] [--press-budget 10] [--regions turkiye,abd]
+// Yerel deneme:  node gundem.mjs [--prev eski/state.json] [--out klasor] [--budget 5] [--press-budget 10] [--bing-budget 10] [--regions turkiye,abd]
 
 import { spawn } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -29,7 +29,11 @@ const PRESS_ITEMS = 3;                      // trend öğesindeki haber
 const PRESS_BUDGET = 140;                   // bir çalışmadaki en çok Google News isteği; Actions'tan 429 kimi çalışmada ~150'de, kimisinde ilk 2-40 istekte geliyor (2026-11-18)
 const PRESS_GAP_MS = 1_000;                 // Google News istekleri arasındaki en kısa ara
 const PRESS_REFRESH_MS = 4 * HOUR;          // gündemde kalan trendin haberleri (bölge ve İngilizce) en çok bu sıklıkla yenilenir; 2 saatte istek Google News'in kaldırdığından fazlaydı
-const ENGLISH_EVERY = 3;                    // Google News isteklerinin her üçünden biri İngilizce haberlere ayrılır
+const PRESS_EMPTY_REFRESH_MS = 12 * HOUR;   // haber bulunamamış arama (çoğu etiket kampanyası) bu kadar sonra yinelenir; bölge aramalarının ~%30'u, İngilizcelerin ~%50'si boş dönüyor
+const ENGLISH_EVERY = 3;                    // haber aramalarının her üçünden biri İngilizce haberlere ayrılır
+const BING_NEWS = 'https://www.bing.com/news/search'; // Google News durunca kalan haber aramaları Bing News'in RSS'inden
+const BING_BUDGET = 100;                    // bir çalışmadaki en çok Bing News isteği
+const BING_GAP_MS = 1_500;                  // Bing News istekleri arasındaki en kısa ara
 const TWEETS = 3;                           // haber bulunamayan trend öğesindeki tweet
 const SEARCH_BUDGET = 30;                   // bir çalışmadaki en çok X araması (X'in arama sınırı hesap başına 15 dakikada ~50)
 const SEARCH_GAP_MS = 2_000;                // aramalar arasındaki en kısa ara
@@ -85,14 +89,15 @@ const REGIONS = [
 const flagOf = region => region.path ? String.fromCodePoint(...(/gl=([A-Z]{2})/.exec(region.news)[1]).split('').map(c => 0x1F1E6 + c.charCodeAt(0) - 65)) : '🌍';
 
 const { values: args } = parseArgs({ options: {
-  prev: { type: 'string' }, out: { type: 'string' }, budget: { type: 'string' }, 'press-budget': { type: 'string' }, regions: { type: 'string' },
+  prev: { type: 'string' }, out: { type: 'string' }, budget: { type: 'string' }, 'press-budget': { type: 'string' }, 'bing-budget': { type: 'string' }, regions: { type: 'string' },
 } });
 const baseUrl = (process.env.BASE_URL || '').replace(/\/?$/, '/');
 const outDir = args.out || process.env.OUT_DIR || 'public';
 const budget = args.budget ? Number(args.budget) : SEARCH_BUDGET;
 const pressBudget = args['press-budget'] ? Number(args['press-budget']) : PRESS_BUDGET;
+const bingBudget = args['bing-budget'] ? Number(args['bing-budget']) : BING_BUDGET;
 const regions = args.regions ? REGIONS.filter(r => args.regions.split(',').includes(r.slug)) : REGIONS;
-if (!regions.length || !(budget >= 0) || !(pressBudget >= 0)) { console.error('HATA: --regions, --budget ya da --press-budget geçersiz.'); process.exit(2); }
+if (!regions.length || !(budget >= 0) || !(pressBudget >= 0) || !(bingBudget >= 0)) { console.error('HATA: --regions, --budget, --press-budget ya da --bing-budget geçersiz.'); process.exit(2); }
 const BIRD = process.env.BIRD || 'bird';
 const auth = { AUTH_TOKEN: process.env.AUTH_TOKEN || process.env.BIRD_AUTH_TOKEN || '', CT0: process.env.CT0 || process.env.BIRD_CT0 || '' };
 const hasAuth = Boolean(auth.AUTH_TOKEN && auth.CT0);
@@ -257,24 +262,49 @@ async function translateAll(texts, cache, queue) {
   return done;
 }
 
-// ---- Haberler: Google News'in arama RSS'i, bölgenin ülkesi ve diliyle, son 24 saat. Etiket okunur biçimiyle aranır.
+// ---- Haberler: Google News'in arama RSS'i, bölgenin ülkesi ve diliyle, son 24 saat. Etiket okunur biçimiyle aranır. Google
+// engellediğinde (429, 5xx) ya da bütçesi bittiğinde kalan aramalar Bing News'in RSS'inden yapılır: aynı ülke ve dil, son 24 saat.
 
-async function fetchPress(term, news) {
-  const query = `"${term.replace(/"/g, '')}" when:1d`;
-  const res = await get(`${GNEWS}?q=${encodeURIComponent(query)}&${news}`);
-  if (!res.ok) throw Object.assign(new Error(`Google News HTTP ${res.status}`), { stop: res.status === 429 || res.status >= 500 });
+// RSS öğelerinden en çok PRESS_ITEMS yeni ve tekrarsız haber; pick sağlayıcıya göre başlığı, kaynağı ve bağlantıyı verir.
+function pressItems(body, pick) {
   const seen = new Set(), list = [];
-  for (const [, item] of res.body.matchAll(/<item>([\s\S]*?)<\/item>/g)) {
+  for (const [, item] of body.matchAll(/<item>([\s\S]*?)<\/item>/g)) {
     const field = tag => decode(new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)</${tag}>`).exec(item)?.[1] ?? '').trim();
-    const source = field('source'), url = field('link'), at = Date.parse(field('pubDate')) || null;
-    let title = field('title');
-    if (source && title.endsWith(` - ${source}`)) title = title.slice(0, -source.length - 3).trim();
+    const { title, source, url } = pick(field), at = Date.parse(field('pubDate')) || null;
     if (!title || !url || seen.has(title.toLowerCase()) || (at && Date.now() - at > WINDOW_MS)) continue;
     seen.add(title.toLowerCase());
     list.push({ title, source, url, at });
     if (list.length >= PRESS_ITEMS) break;
   }
   return list;
+}
+const phrase = term => `"${term.replace(/"/g, '')}"`;
+
+async function fetchPress(term, news) {
+  const res = await get(`${GNEWS}?q=${encodeURIComponent(`${phrase(term)} when:1d`)}&${news}`);
+  if (!res.ok) throw Object.assign(new Error(`Google News HTTP ${res.status}`), { stop: res.status === 429 || res.status >= 500 });
+  return pressItems(res.body, field => {
+    const source = field('source');
+    let title = field('title');
+    if (source && title.endsWith(` - ${source}`)) title = title.slice(0, -source.length - 3).trim();
+    return { title, source, url: field('link') };
+  });
+}
+
+// Bing'in bağlantısı kendi yönlendirmesidir (apiclick.aspx?…&url=<asıl adres>); asıl adres alınır. MSN'de yeniden yayımlanan haberin
+// kaynağı "Hürriyet on MSN" diye gelir; "on MSN" atılır. Sınıra takılan istek RSS yerine doğrulama sayfası döndürebilir: RSS
+// gelmezse "haber yok" diye saklanmaz, hata sayılır ve Bing o çalışmada bırakılır.
+async function fetchBing(term, news) {
+  const p = new URLSearchParams(news);
+  const query = new URLSearchParams({ q: phrase(term), format: 'rss', setlang: p.get('hl').split('-')[0], cc: p.get('gl'), qft: 'interval="7"' });
+  const res = await get(`${BING_NEWS}?${query}`);
+  if (!res.ok || !/<rss\b/.test(res.body)) throw Object.assign(new Error(`Bing News ${res.ok ? 'RSS döndürmedi' : `HTTP ${res.status}`}`), { stop: true });
+  return pressItems(res.body, field => {
+    const link = field('link');
+    let url = link;
+    try { url = new URL(link).searchParams.get('url') || link; } catch { /* bağlantı olduğu gibi kalır */ }
+    return { title: field('title'), source: field('News:Source').replace(/ on MSN$/, ''), url };
+  });
 }
 
 // İngilizce haber araması dili İngilizce ya da Türkçe olan bölgelerde ve Dünya'da (haberleri zaten ABD baskısından) yapılmaz; çok dilli
@@ -550,42 +580,53 @@ async function main() {
   }
   if (dropped) console.log(`Trend sörfü: saklı ${dropped} tweet çıkarıldı; o trendler yeniden aranacak.`);
 
-  // 2. Haberler: bölgenin kendi haberleri ve İngilizce haberler aynı bütçeden, iç içe: her ENGLISH_EVERY istekten biri İngilizce
+  // 2. Haberler: bölgenin kendi haberleri ve İngilizce haberler aynı kuyrukta, iç içe: her ENGLISH_EVERY aramadan biri İngilizce
   // (bölge haberi kalmadıysa hepsi). Google News Actions'tan bazen ilk birkaç istekte 429 verdiği için İngilizce haberler bölgenin
   // haberlerinin ardına kalınca hiç sıra gelmiyordu. Her kolda önce hiç çekilmemişler (iyi sıradan başlayarak), sonra yenilenmesi
-  // gelenler. Bölgeler arasında ortak İngilizce terim bir kez aranır.
+  // gelenler; haber bulunamamış arama daha seyrek yenilenir. Bölgeler arasında ortak İngilizce terim bir kez aranır.
+  // Arama önce Google News'te yapılır; Google durunca (429, 5xx) ya da bütçesi bitince aynı aramadan başlayarak Bing News'e geçilir.
+  const pressStale = entry => !entry || now - entry.at >= (entry.list.length ? PRESS_REFRESH_MS : PRESS_EMPTY_REFRESH_MS);
   const pressDue = regions.flatMap(region => (current.get(region.slug) ?? []).map((name, i) => ({ region, name, rank: i + 1, id: `${region.slug}:${keyOf(name)}` })))
-    .filter(({ id }) => !state.press[id] || now - state.press[id].at >= PRESS_REFRESH_MS)
+    .filter(({ id }) => pressStale(state.press[id]))
     .sort((a, b) => Number(Boolean(state.press[a.id])) - Number(Boolean(state.press[b.id])) || a.rank - b.rank);
   const englishWant = new Map();
   for (const region of regions) (current.get(region.slug) ?? []).forEach((name, i) => {
     const term = englishTerm(region, name, state.translations), had = englishWant.get(term);
     if (term && (had == null || i + 1 < had)) englishWant.set(term, i + 1);
   });
-  const englishDue = [...englishWant].filter(([term]) => !state.english[term] || now - state.english[term].at >= PRESS_REFRESH_MS)
+  const englishDue = [...englishWant].filter(([term]) => pressStale(state.english[term]))
     .sort(([a, ra], [b, rb]) => Number(Boolean(state.english[a])) - Number(Boolean(state.english[b])) || ra - rb);
-  const tally = { press: { done: 0, found: 0, calls: 0 }, english: { done: 0, found: 0, calls: 0 } };
+  const tally = { press: { done: 0, found: 0 }, english: { done: 0, found: 0 } };
   const pressJobs = pressDue.map(({ region, name, id }) => ({ term: words(name), news: region.news, box: state.press, key: id,
     t: tally.press, label: `"${name}" (${region.name}) haberleri` }));
   const englishJobs = englishDue.map(([term]) => ({ term, news: ENGLISH_NEWS, box: state.english, key: term,
     t: tally.english, label: `"${term}" İngilizce haberleri` }));
-  const pressQueue = limiter(pressBudget, PRESS_GAP_MS);
-  while (pressJobs.length || englishJobs.length) {
-    const englishTurn = !pressJobs.length || pressQueue.used % ENGLISH_EVERY === ENGLISH_EVERY - 1;
-    const job = (englishTurn && englishJobs.length ? englishJobs : pressJobs).shift();
+  const providers = [
+    { name: 'Google News', budget: pressBudget, queue: limiter(pressBudget, PRESS_GAP_MS), fetch: fetchPress },
+    { name: 'Bing News', budget: bingBudget, queue: limiter(bingBudget, BING_GAP_MS), fetch: fetchBing },
+  ];
+  let provider = 0, turn = 0;
+  while ((pressJobs.length || englishJobs.length) && provider < providers.length) {
+    const lane = englishJobs.length && (!pressJobs.length || turn % ENGLISH_EVERY === ENGLISH_EVERY - 1) ? englishJobs : pressJobs;
+    const job = lane[0], { name, queue, fetch } = providers[provider];
     try {
-      const list = await pressQueue.run(() => { job.t.calls++; return fetchPress(job.term, job.news); });
+      const list = await queue.run(() => fetch(job.term, job.news));
       job.box[job.key] = { at: Date.now(), list };
       job.t.done++; if (list.length) job.t.found++;
     } catch (e) {
-      if (e.budget) break;
+      if (e.stop || e.budget) {
+        if (e.stop) console.log(`${job.label} alınamadı: ${e.message}`);
+        const next = providers[++provider];
+        console.log(`${name} ${e.budget ? 'bütçesi bitti' : 'durdu'}; ${next ? `kalan aramalarda ${next.name} kullanılıyor.` : 'kalan aramalar sonraki çalışmaya kaldı.'}`);
+        continue; // aynı arama sıradaki sağlayıcıyla
+      }
       console.log(`${job.label} alınamadı: ${e.message}`);
-      if (e.stop) { console.log('Google News istekleri sonraki çalışmaya kaldı.'); break; }
     }
+    lane.shift(); turn++;
   }
-  console.log(`Haber: ${tally.press.done}/${pressDue.length} trend güncellendi, ${tally.press.found} trendde haber var, ${tally.press.calls} istek.`);
-  console.log(`İngilizce haber: ${tally.english.done}/${englishDue.length} terim güncellendi, ${tally.english.found} terimde haber var, ${tally.english.calls} istek.`);
-  console.log(`Google News: ${pressQueue.used}/${pressBudget} istek.`);
+  console.log(`Haber: ${tally.press.done}/${pressDue.length} trend güncellendi, ${tally.press.found} trendde haber var.`);
+  console.log(`İngilizce haber: ${tally.english.done}/${englishDue.length} terim güncellendi, ${tally.english.found} terimde haber var.`);
+  console.log(`Haber isteği: ${providers.map(p => `${p.name} ${p.queue.used}/${p.budget}`).join(', ')}.`);
 
   if (hasAuth) {
     // 3. X'in Keşfet sekmeleri: trend kategorileri ve X'in habere çevirdiği konular.
