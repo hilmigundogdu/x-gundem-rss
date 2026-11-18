@@ -2,7 +2,7 @@
 // X (Twitter) trendlerini bölge bölge RSS 2.0 beslemelerine çevirir (Node 22). Her trend öğesinde o ülkenin dilinde son 24 saatin
 // haberleri vardır; haber bulunamayan trendde (çoğunlukla etiket kampanyaları) en beğenilen tweet'ler gösterilir.
 // Trend listesi trends24.in'den (X'in bölge trendlerini saatlik yayımlar; kimlik istemez), haberler Google News'in arama RSS'inden
-// gelir. Tweet'ler, X'in haber sayfaları (haberler.xml) ve trend kategorileri bird CLI'yla (@steipete/bird, X'in web GraphQL'i,
+// gelir; ülkenin haberleri İngilizce ya da Türkçe değilse aynı trend İngilizce haberlerde de aranır. Tweet'ler, X'in haber sayfaları (haberler.xml) ve trend kategorileri bird CLI'yla (@steipete/bird, X'in web GraphQL'i,
 // oturum çerezi) çekilir. İngilizce ve Türkçe dışındaki trend adı, başlık ve tweet'lerin İngilizce ve Türkçe çevirisi öğenin
 // sonuna eklenir (Google Translate'in anahtarsız ucu; X'in "çevir" düğmesi de Google çevirisi gösterir).
 //
@@ -39,6 +39,7 @@ const KEEP_MS = DAY;                        // gündemden düşen trend son gör
 const MAX_ITEMS = 40;                       // bölge beslemesindeki en çok öğe
 const STORY_KEEP_MS = 3 * DAY;              // X haberi son görülmesinden sonra bu kadar süre kalır
 const STORY_MATCH_MS = 6 * HOUR;            // trend öğesine yalnız bu kadar yakın zamanda görülmüş X haberi bağlanır
+const ENGLISH_NEWS = 'hl=en-US&gl=US&ceid=US:en'; // İngilizce haber araması: Google News'in ABD baskısı
 const TRANSLATE = 'https://translate.googleapis.com/translate_a/t';
 const TRANSLATE_BATCH = 40, TRANSLATE_CHARS = 4_000; // bir çeviri isteğindeki en çok metin ve karakter
 const TRANSLATE_GAP_MS = 1_000;             // çeviri istekleri arasındaki en kısa ara
@@ -147,9 +148,9 @@ function limiter(max, gap) {
 
 // ---- Durum: önceki çalışmanın state.json'u; ilk görülme anlarını, haberleri ve tweet'leri taşır.
 // regions[slug].trends[anahtar], press["slug:anahtar"], tweets[anahtar], context[anahtar], stories[id] (X haberleri),
-// translations[özgün metin] = { lang, en, tr } (çeviri gerekmiyorsa en ve tr null).
+// translations[özgün metin] = { lang, en, tr } (çeviri gerekmiyorsa en ve tr null), english[arama terimi] = { at, list } (İngilizce haberler).
 
-const emptyState = () => ({ version: 2, regions: {}, press: {}, tweets: {}, context: {}, stories: {}, translations: {} });
+const emptyState = () => ({ version: 2, regions: {}, press: {}, tweets: {}, context: {}, stories: {}, translations: {}, english: {} });
 
 async function loadState() {
   let raw;
@@ -232,9 +233,9 @@ async function translateAll(texts, cache, queue) {
 
 // ---- Haberler: Google News'in arama RSS'i, bölgenin ülkesi ve diliyle, son 24 saat. Etiket okunur biçimiyle aranır.
 
-async function fetchPress(name, region) {
-  const query = `"${words(name).replace(/"/g, '')}" when:1d`;
-  const res = await get(`${GNEWS}?q=${encodeURIComponent(query)}&${region.news}`);
+async function fetchPress(term, news) {
+  const query = `"${term.replace(/"/g, '')}" when:1d`;
+  const res = await get(`${GNEWS}?q=${encodeURIComponent(query)}&${news}`);
   if (!res.ok) throw Object.assign(new Error(`Google News HTTP ${res.status}`), { stop: res.status === 429 || res.status >= 500 });
   const seen = new Set(), list = [];
   for (const [, item] of res.body.matchAll(/<item>([\s\S]*?)<\/item>/g)) {
@@ -248,6 +249,16 @@ async function fetchPress(name, region) {
     if (list.length >= PRESS_ITEMS) break;
   }
   return list;
+}
+
+// İngilizce haber araması ABD, Birleşik Krallık, Türkiye ve Dünya (haberleri zaten ABD baskısından) dışında yapılır; Hindistan'da da
+// (yerel haberleri Hindistan İngilizcesi, Hintçe trendler orada bulunmaz). Latin harfli ad olduğu gibi aranır; öteki yazılardaki ad
+// İngilizce çevirisiyle ("Крым" → "Crimea"; çevirisi henüz yoksa sonraki çalışmada).
+const latinOnly = s => !/\p{L}/u.test(s.replace(/\p{Script=Latin}/gu, ''));
+function englishTerm(region, name, translations) {
+  if (region.lang === 'en' || region.lang === 'tr' || region.news === ENGLISH_NEWS) return null;
+  const term = words(name);
+  return latinOnly(term) ? term : translations[term]?.en ?? null;
 }
 
 // ---- Tweet'ler: X'in "Latest" araması (bird "Top"u desteklemiyor) son 24 saat ve beğeni eşiğiyle süzülür, en beğenilenler alınır.
@@ -334,6 +345,7 @@ function storyFor(name, stories, now) {
 
 // ---- RSS
 
+const pressList = list => `<ul>\n${list.map(n => `<li><a href="${esc(n.url)}">${esc(n.title)}</a> — ${esc(n.source || 'haber')}${n.at ? ` · ${time(n.at)}` : ''}</li>`).join('\n')}\n</ul>`;
 const prose = text => esc(text).replace(/https?:\/\/[^\s<]+/g, u => `<a href="${u}">${u}</a>`).replace(/\n/g, '<br>');
 
 // Haberi olmayan trend öğesinde gösterilen tweet'ler: bu çalışmanın trend listesiyle trend sörfüne karşı süzülür.
@@ -371,7 +383,7 @@ function renderTweet(t) {
 
 // Okuyucular özeti description'ın ilk satırlarından çıkardığı için orada önce bağlam, X haberi ve haberler, sıra bilgisi en sonda;
 // tweet'ler yalnız haber yoksa. Okuma sayfası content:encoded'dır: aynı gövde, sıra bilgisi en başta.
-function trendItem(region, seen, { press, tweets, context, story, names, translations }) {
+function trendItem(region, seen, { press, tweets, context, story, names, translations, english }) {
   const name = seen.name, lines = [];
   if (context) lines.push(`<p><b>${esc(context.category || 'X')}</b>${context.description ? ` — ${esc(context.description)}` : ''}</p>`);
   if (story) {
@@ -380,7 +392,7 @@ function trendItem(region, seen, { press, tweets, context, story, names, transla
   }
   let note = '';
   if (press?.list.length) {
-    lines.push(`<ul>\n${press.list.map(n => `<li><a href="${esc(n.url)}">${esc(n.title)}</a> — ${esc(n.source || 'haber')}${n.at ? ` · ${time(n.at)}` : ''}</li>`).join('\n')}\n</ul>`);
+    lines.push(pressList(press.list));
     note = ` · haberler ${time(press.at)} itibarıyla`;
   } else {
     const list = shownTweets(tweets, name, names);
@@ -390,6 +402,10 @@ function trendItem(region, seen, { press, tweets, context, story, names, transla
     else lines.push('<p>Son 24 saatte bu konuda haber de beğeni eşiğini geçen tweet de bulunamadı.</p>');
   }
   lines.push(...translationSection(originals(name, press, tweets, names), translations));
+  // Arama terimi trendin adından farklıysa (çeviriyle arandıysa) yazılır: eşleşmenin isabeti görülebilsin.
+  // Bölgenin kendi listesinde de olan başlık (Hindistan'da ikisi de İngilizce) tekrarlanmaz.
+  const extra = (english?.list ?? []).filter(n => !press?.list.some(p => sameText(p.title, n.title) || p.url === n.url));
+  if (extra.length) lines.push('<hr>', `<p><b>İngilizce haberler</b>${english.term !== words(name) ? ` · “${esc(english.term)}” araması` : ''}</p>`, pressList(extra));
   const meta = `<p><small>${esc(region.where)} ${seen.rank != null ? `${seen.rank}. sırada · ilk görülme ${time(seen.firstSeen)}`
     : `gündemden düştü · son görülme ${time(seen.lastSeen)}, en iyi sıra ${seen.best}.`}${note} · <a href="${esc(searchUrl(name))}">X'te ara</a></small></p>`;
   return {
@@ -513,19 +529,42 @@ async function main() {
     .filter(({ id }) => !state.press[id] || now - state.press[id].at >= PRESS_REFRESH_MS)
     .sort((a, b) => Number(Boolean(state.press[a.id])) - Number(Boolean(state.press[b.id])) || a.rank - b.rank);
   const pressQueue = limiter(pressBudget, PRESS_GAP_MS);
-  let pressDone = 0, pressFound = 0;
+  let pressDone = 0, pressFound = 0, pressStopped = false;
   for (const { region, name, id } of pressDue) {
     try {
-      const list = await pressQueue.run(() => fetchPress(name, region));
+      const list = await pressQueue.run(() => fetchPress(words(name), region.news));
       state.press[id] = { at: Date.now(), list };
       pressDone++; if (list.length) pressFound++;
     } catch (e) {
-      if (e.budget) break;
+      if (e.budget) { pressStopped = true; break; }
       console.log(`"${name}" (${region.name}) haberleri alınamadı: ${e.message}`);
-      if (e.stop) { console.log('Google News istekleri sonraki çalışmaya kaldı.'); break; }
+      if (e.stop) { console.log('Google News istekleri sonraki çalışmaya kaldı.'); pressStopped = true; break; }
     }
   }
   console.log(`Haber: ${pressDone}/${pressDue.length} trend güncellendi, ${pressFound} trendde haber var, ${pressQueue.used}/${pressBudget} istek.`);
+
+  // İngilizce haberler, bölgenin kendi haberlerinden sonra aynı bütçeyle. Bölgeler arasında ortak terim bir kez aranır.
+  const englishWant = new Map();
+  for (const region of regions) (current.get(region.slug) ?? []).forEach((name, i) => {
+    const term = englishTerm(region, name, state.translations), had = englishWant.get(term);
+    if (term && (had == null || i + 1 < had)) englishWant.set(term, i + 1);
+  });
+  const englishDue = [...englishWant].filter(([term]) => !state.english[term] || now - state.english[term].at >= PRESS_REFRESH_MS)
+    .sort(([a, ra], [b, rb]) => Number(Boolean(state.english[a])) - Number(Boolean(state.english[b])) || ra - rb);
+  let englishDone = 0, englishFound = 0;
+  const englishStart = pressQueue.used;
+  if (!pressStopped) for (const [term] of englishDue) {
+    try {
+      const list = await pressQueue.run(() => fetchPress(term, ENGLISH_NEWS));
+      state.english[term] = { at: Date.now(), list };
+      englishDone++; if (list.length) englishFound++;
+    } catch (e) {
+      if (e.budget) break;
+      console.log(`"${term}" İngilizce haberleri alınamadı: ${e.message}`);
+      if (e.stop) { console.log('İngilizce haber aramaları sonraki çalışmaya kaldı.'); break; }
+    }
+  }
+  console.log(`İngilizce haber: ${englishDone}/${englishDue.length} terim güncellendi, ${englishFound} terimde haber var, ${pressQueue.used - englishStart} istek.`);
 
   if (hasAuth) {
     // 3. X'in Keşfet sekmeleri: trend kategorileri ve X'in habere çevirdiği konular.
@@ -611,6 +650,8 @@ async function main() {
     catch (e) { done = todo.filter(text => state.translations[text]).length; console.log(`Çeviri yarıda kaldı: ${e.message}`); }
     console.log(`Çeviri: ${done}/${todo.length} metin, ${queue.used} istek.`);
   }
+  const englishUsed = new Set(REGIONS.flatMap(region => listed(region).map(({ seen }) => englishTerm(region, seen.name, state.translations))));
+  for (const term of Object.keys(state.english)) if (!englishUsed.has(term)) delete state.english[term];
 
   // 6. Yazma.
   await mkdir(outDir, { recursive: true });
@@ -621,7 +662,8 @@ async function main() {
     const items = listed(region).map(({ key, seen, press, tweets }) => {
       const story = storyFor(seen.name, state.stories, now);
       if (story) linked++;
-      return trendItem(region, seen, { press, tweets, context: state.context[key], story, names, translations: state.translations });
+      const term = englishTerm(region, seen.name, state.translations), english = term && state.english[term] ? { term, ...state.english[term] } : null;
+      return trendItem(region, seen, { press, tweets, context: state.context[key], story, names, translations: state.translations, english });
     });
     const file = `${region.slug}.xml`, title = `X Trend · ${region.name}`;
     await writeFile(join(outDir, file), render({ file, title, link: `${TRENDS24}${region.path}`,
