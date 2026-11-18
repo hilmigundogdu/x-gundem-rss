@@ -202,8 +202,14 @@ function parseTrends24(html) {
   return { at: Math.round(parseFloat(head[1]) * 1000), names: all.slice(0, TOP), all };
 }
 
+// Cloudflare Actions'tan ana sayfaya (Dünya) gelen isteği ülke sayfalarından çok daha sık reddediyor (403); aynı sayfa
+// index.html adından da sunuluyor, ana sayfa reddedilince o denenir.
 async function fetchTrends(region) {
-  const res = await get(TRENDS24 + region.path);
+  let res = await get(TRENDS24 + region.path);
+  if (res.status === 403 && !region.path) {
+    res = await get(`${TRENDS24}index.html`);
+    console.log(`${region.name}: ana sayfa 403 verdi, index.html ${res.ok ? 'alındı' : `de reddedildi (HTTP ${res.status})`}.`);
+  }
   if (!res.ok) throw new Error(`trends24 HTTP ${res.status}`);
   return parseTrends24(res.body);
 }
