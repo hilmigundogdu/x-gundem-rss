@@ -80,6 +80,9 @@ const REGIONS = [
   { slug: 'avustralya', name: 'Avustralya', where: "Avustralya'da", path: 'australia/', lang: 'en', faves: 100, news: 'hl=en-AU&gl=AU&ceid=AU:en' },
 ];
 
+// Öğe başlığının başındaki bayrak: Google News'in ülke kodundan (gl=ES → 🇪🇸; bölgesel gösterge harfleri). Dünya'nınki 🌍.
+const flagOf = region => region.path ? String.fromCodePoint(...(/gl=([A-Z]{2})/.exec(region.news)[1]).split('').map(c => 0x1F1E6 + c.charCodeAt(0) - 65)) : '🌍';
+
 const { values: args } = parseArgs({ options: {
   prev: { type: 'string' }, out: { type: 'string' }, budget: { type: 'string' }, 'press-budget': { type: 'string' }, regions: { type: 'string' },
 } });
@@ -431,7 +434,7 @@ function trendItem(region, seen, { press, tweets, context, story, names, transla
   const meta = `<p><small>${esc(region.where)} ${seen.rank != null ? `${seen.rank}. sırada · ilk görülme ${time(seen.firstSeen)}`
     : `gündemden düştü · son görülme ${time(seen.lastSeen)}, en iyi sıra ${seen.best}.`}${note} · <a href="${esc(searchUrl(name))}">X'te ara</a></small></p>`;
   return {
-    title: name, link: searchUrl(name), guid: `x-gundem:${region.slug}:${keyOf(name)}`, date: seen.firstSeen,
+    title: `${flagOf(region)} ${name}`, link: searchUrl(name), guid: `x-gundem:${region.slug}:${keyOf(name)}`, date: seen.firstSeen,
     categories: [region.name, ...(context?.category ? [context.category] : [])],
     description: [...lines, meta].join('\n'), content: [meta, ...lines].join('\n'),
   };

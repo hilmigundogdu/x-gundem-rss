@@ -39,7 +39,7 @@ X'te "Avrupa" diye bir trend bölgesi yok; Avrupa ülke ülke verilir. Çin ve �
 
 ## Öğeler
 
-- **Trend** (bölge beslemeleri): başlık trendin adıdır, bağlantı X'teki aramasını açar (X'te trende tıklayınca açılan sayfa). `guid` bölge ve trend adından oluşur, değişmez; `pubDate` trendin o bölgede ilk görüldüğü andır. İçerik sırasıyla:
+- **Trend** (bölge beslemeleri): başlık bölgenin bayrağı ve trendin adıdır (`🇪🇸 Franganillo`; Dünya'da 🌍), bağlantı X'teki aramasını açar (X'te trende tıklayınca açılan sayfa). `guid` bölge ve trend adından oluşur, değişmez; `pubDate` trendin o bölgede ilk görüldüğü andır. İçerik sırasıyla:
   - X'in kategorisi biliniyorsa (ör. "Politics"; "Trending worldwide" gibi genel etiketler alınmaz),
   - X trendi habere çevirdiyse o haberin sayfası (`x.com/i/trending/<id>`; Grok özeti ve gönderiler orada) ve görseli,
   - o ülkenin dilinde son 24 saatin 3 haberi (başlık, yayın, saat),
