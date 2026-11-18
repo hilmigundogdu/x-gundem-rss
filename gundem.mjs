@@ -45,7 +45,8 @@ const TRANSLATE_GAP_MS = 1_000;             // çeviri istekleri arasındaki en 
 const FETCH_TIMEOUT_MS = 30_000;
 const BIRD_TIMEOUT_MS = 90_000;
 
-// faves: ilk tweet aramasındaki beğeni eşiği; lang: X'in dil süzgeci (Dünya'da yok); news: Google News'in ülke ve dil parametreleri.
+// faves: ilk tweet aramasındaki beğeni eşiği; lang: X'in dil süzgeci (Dünya'da ve çok dilli Hindistan'da yok); news: Google News'in
+// ülke ve dil parametreleri. Çin yok: X orada yasaklı, Çin için trend yayımlamıyor (trends24'te de yok).
 const REGIONS = [
   { slug: 'dunya', name: 'Dünya', where: 'Dünyada', path: '', lang: null, faves: 500, news: 'hl=en-US&gl=US&ceid=US:en' },
   { slug: 'abd', name: 'ABD', where: "ABD'de", path: 'united-states/', lang: 'en', faves: 500, news: 'hl=en-US&gl=US&ceid=US:en' },
@@ -56,6 +57,10 @@ const REGIONS = [
   { slug: 'ispanya', name: 'İspanya', where: "İspanya'da", path: 'spain/', lang: 'es', faves: 100, news: 'hl=es&gl=ES&ceid=ES:es' },
   { slug: 'italya', name: 'İtalya', where: "İtalya'da", path: 'italy/', lang: 'it', faves: 100, news: 'hl=it&gl=IT&ceid=IT:it' },
   { slug: 'hollanda', name: 'Hollanda', where: "Hollanda'da", path: 'netherlands/', lang: 'nl', faves: 50, news: 'hl=nl&gl=NL&ceid=NL:nl' },
+  { slug: 'japonya', name: 'Japonya', where: "Japonya'da", path: 'japan/', lang: 'ja', faves: 500, news: 'hl=ja&gl=JP&ceid=JP:ja' },
+  { slug: 'guney-kore', name: 'Güney Kore', where: "Güney Kore'de", path: 'korea/', lang: 'ko', faves: 200, news: 'hl=ko&gl=KR&ceid=KR:ko' },
+  { slug: 'hindistan', name: 'Hindistan', where: "Hindistan'da", path: 'india/', lang: null, faves: 200, news: 'hl=en-IN&gl=IN&ceid=IN:en' },
+  { slug: 'rusya', name: 'Rusya', where: "Rusya'da", path: 'russia/', lang: 'ru', faves: 50, news: 'hl=ru&gl=RU&ceid=RU:ru' },
 ];
 
 const { values: args } = parseArgs({ options: {
