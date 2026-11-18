@@ -26,7 +26,7 @@ const GNEWS = 'https://news.google.com/rss/search';
 const HOUR = 60 * 60 * 1000, DAY = 24 * HOUR;
 const TOP = 10;                             // bölge başına beslemeye giren trend
 const PRESS_ITEMS = 3;                      // trend öğesindeki haber
-const PRESS_BUDGET = 100;                   // bir çalışmadaki en çok Google News isteği
+const PRESS_BUDGET = 200;                   // bir çalışmadaki en çok Google News isteği (29 bölge × 10 trend, yerel ve İngilizce, 2 saatte bir)
 const PRESS_GAP_MS = 1_000;                 // Google News istekleri arasındaki en kısa ara
 const PRESS_REFRESH_MS = 2 * HOUR;          // gündemde kalan trendin haberleri en çok bu sıklıkla yenilenir
 const TWEETS = 3;                           // haber bulunamayan trend öğesindeki tweet
@@ -46,8 +46,8 @@ const TRANSLATE_GAP_MS = 1_000;             // çeviri istekleri arasındaki en 
 const FETCH_TIMEOUT_MS = 30_000;
 const BIRD_TIMEOUT_MS = 90_000;
 
-// faves: ilk tweet aramasındaki beğeni eşiği; lang: X'in dil süzgeci (Dünya'da ve çok dilli Hindistan'da yok); news: Google News'in
-// ülke ve dil parametreleri. Çin yok: X orada yasaklı, Çin için trend yayımlamıyor (trends24'te de yok).
+// faves: ilk tweet aramasındaki beğeni eşiği; lang: X'in dil süzgeci (Dünya'da ve çok dilli ülkelerde yok: Hindistan, BAE, Pakistan,
+// Filipinler, Singapur); news: Google News'in ülke ve dil parametreleri. Çin ve İran yok: X orada yasaklı, trends24'te sayfaları yok.
 const REGIONS = [
   { slug: 'dunya', name: 'Dünya', where: 'Dünyada', path: '', lang: null, faves: 500, news: 'hl=en-US&gl=US&ceid=US:en' },
   { slug: 'abd', name: 'ABD', where: "ABD'de", path: 'united-states/', lang: 'en', faves: 500, news: 'hl=en-US&gl=US&ceid=US:en' },
@@ -62,6 +62,22 @@ const REGIONS = [
   { slug: 'guney-kore', name: 'Güney Kore', where: "Güney Kore'de", path: 'korea/', lang: 'ko', faves: 200, news: 'hl=ko&gl=KR&ceid=KR:ko' },
   { slug: 'hindistan', name: 'Hindistan', where: "Hindistan'da", path: 'india/', lang: null, faves: 200, news: 'hl=en-IN&gl=IN&ceid=IN:en' },
   { slug: 'rusya', name: 'Rusya', where: "Rusya'da", path: 'russia/', lang: 'ru', faves: 50, news: 'hl=ru&gl=RU&ceid=RU:ru' },
+  { slug: 'kanada', name: 'Kanada', where: "Kanada'da", path: 'canada/', lang: 'en', faves: 100, news: 'hl=en-CA&gl=CA&ceid=CA:en' },
+  { slug: 'meksika', name: 'Meksika', where: "Meksika'da", path: 'mexico/', lang: 'es', faves: 200, news: 'hl=es-419&gl=MX&ceid=MX:es-419' },
+  { slug: 'brezilya', name: 'Brezilya', where: "Brezilya'da", path: 'brazil/', lang: 'pt', faves: 500, news: 'hl=pt-BR&gl=BR&ceid=BR:pt-419' },
+  { slug: 'arjantin', name: 'Arjantin', where: "Arjantin'de", path: 'argentina/', lang: 'es', faves: 200, news: 'hl=es-419&gl=AR&ceid=AR:es-419' },
+  { slug: 'suudi-arabistan', name: 'Suudi Arabistan', where: "Suudi Arabistan'da", path: 'saudi-arabia/', lang: 'ar', faves: 500, news: 'hl=ar&gl=SA&ceid=SA:ar' },
+  { slug: 'bae', name: 'BAE', where: "BAE'de", path: 'united-arab-emirates/', lang: null, faves: 50, news: 'hl=ar&gl=AE&ceid=AE:ar' },
+  { slug: 'israil', name: 'İsrail', where: "İsrail'de", path: 'israel/', lang: 'he', faves: 50, news: 'hl=he&gl=IL&ceid=IL:he' },
+  { slug: 'misir', name: 'Mısır', where: "Mısır'da", path: 'egypt/', lang: 'ar', faves: 200, news: 'hl=ar&gl=EG&ceid=EG:ar' },
+  { slug: 'nijerya', name: 'Nijerya', where: "Nijerya'da", path: 'nigeria/', lang: 'en', faves: 200, news: 'hl=en-NG&gl=NG&ceid=NG:en' },
+  { slug: 'kenya', name: 'Kenya', where: "Kenya'da", path: 'kenya/', lang: 'en', faves: 100, news: 'hl=en-KE&gl=KE&ceid=KE:en' },
+  { slug: 'guney-afrika', name: 'Güney Afrika', where: "Güney Afrika'da", path: 'south-africa/', lang: 'en', faves: 100, news: 'hl=en-ZA&gl=ZA&ceid=ZA:en' },
+  { slug: 'pakistan', name: 'Pakistan', where: "Pakistan'da", path: 'pakistan/', lang: null, faves: 200, news: 'hl=en-PK&gl=PK&ceid=PK:en' },
+  { slug: 'endonezya', name: 'Endonezya', where: "Endonezya'da", path: 'indonesia/', lang: 'id', faves: 500, news: 'hl=id&gl=ID&ceid=ID:id' },
+  { slug: 'filipinler', name: 'Filipinler', where: "Filipinler'de", path: 'philippines/', lang: null, faves: 200, news: 'hl=en-PH&gl=PH&ceid=PH:en' },
+  { slug: 'singapur', name: 'Singapur', where: "Singapur'da", path: 'singapore/', lang: null, faves: 100, news: 'hl=en-SG&gl=SG&ceid=SG:en' },
+  { slug: 'avustralya', name: 'Avustralya', where: "Avustralya'da", path: 'australia/', lang: 'en', faves: 100, news: 'hl=en-AU&gl=AU&ceid=AU:en' },
 ];
 
 const { values: args } = parseArgs({ options: {
@@ -88,8 +104,8 @@ const cdata = s => `<![CDATA[${String(s).replace(INVALID_XML, '').replace(/]]>/g
 const keyOf = name => name.normalize('NFC').toLowerCase();
 // Karşılaştırma biçimi: küçük harf, # ve boşluksuz ("#TuzluKahve" ile "Tuzlu Kahve" aynı olur).
 const squash = s => s.normalize('NFC').toLowerCase().replace(/[#\s_]+/g, '');
-// Etiketin okunur biçimi: "#TheGameAwards" → "The Game Awards".
-const words = name => name.replace(/^#/, '').replace(/([\p{Ll}\d])(\p{Lu})/gu, '$1 $2').replace(/(\p{L})(\d)/gu, '$1 $2').trim();
+// Etiketin okunur biçimi: "#TheGameAwards" → "The Game Awards", "#a_b" → "a b".
+const words = name => name.replace(/^#/, '').replace(/_+/g, ' ').replace(/([\p{Ll}\d])(\p{Lu})/gu, '$1 $2').replace(/(\p{L})(\d)/gu, '$1 $2').replace(/\s+/g, ' ').trim();
 const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const searchUrl = name => `https://x.com/search?q=${encodeURIComponent(name)}&src=trend_click`;
 const storyUrl = id => `https://x.com/i/trending/${id}`;
@@ -251,8 +267,8 @@ async function fetchPress(term, news) {
   return list;
 }
 
-// İngilizce haber araması ABD, Birleşik Krallık, Türkiye ve Dünya (haberleri zaten ABD baskısından) dışında yapılır; Hindistan'da da
-// (yerel haberleri Hindistan İngilizcesi, Hintçe trendler orada bulunmaz). Latin harfli ad olduğu gibi aranır; öteki yazılardaki ad
+// İngilizce haber araması dili İngilizce ya da Türkçe olan bölgelerde ve Dünya'da (haberleri zaten ABD baskısından) yapılmaz; çok dilli
+// bölgelerde yapılır (Hindistan'ın yerel haberleri İngilizce ama Hintçe trendler orada bulunmaz). Latin harfli ad olduğu gibi aranır; öteki yazılardaki ad
 // İngilizce çevirisiyle ("Крым" → "Crimea"; çevirisi henüz yoksa sonraki çalışmada).
 const latinOnly = s => !/\p{L}/u.test(s.replace(/\p{Script=Latin}/gu, ''));
 function englishTerm(region, name, translations) {
