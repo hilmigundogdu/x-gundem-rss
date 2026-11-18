@@ -690,7 +690,7 @@ async function main() {
       const term = englishTerm(region, seen.name, state.translations), english = term && state.english[term] ? { term, ...state.english[term] } : null;
       return trendItem(region, seen, { press, tweets, context: state.context[key], story, names, translations: state.translations, english });
     });
-    const file = `${region.slug}.xml`, title = `X Trend · ${region.name}`;
+    const file = `${region.slug}.xml`, title = `${flagOf(region)} ${region.name} - X Gündem`;
     await writeFile(join(outDir, file), render({ file, title, link: `${TRENDS24}${region.path}`,
       description: `${region.where} X trendleri (trends24.in), son 24 saatin haberleriyle.` }, items, now));
     files.push({ file, title });
