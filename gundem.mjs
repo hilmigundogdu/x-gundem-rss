@@ -24,7 +24,7 @@ const USER_AGENT = `x-gundem-rss/1.0 (+${REPO})`;
 const TRENDS24 = 'https://trends24.in/';
 const GNEWS = 'https://news.google.com/rss/search';
 const HOUR = 60 * 60 * 1000, DAY = 24 * HOUR;
-const TOP = 10;                             // bölge başına beslemeye giren trend
+const TOP = 20;                             // bölge başına beslemeye giren trend (18 Kas 2026'ya dek 10: Akış'a bölge başına saatte ~2 öğe geliyordu)
 const PRESS_ITEMS = 3;                      // trend öğesindeki haber
 const PRESS_BUDGET = 140;                   // bir çalışmadaki en çok Google News isteği; Actions'tan 429 kimi çalışmada ~150'de, kimisinde ilk 2-40 istekte geliyor (2026-11-18)
 const PRESS_GAP_MS = 1_000;                 // Google News istekleri arasındaki en kısa ara
@@ -32,7 +32,7 @@ const PRESS_REFRESH_MS = 4 * HOUR;          // gündemde kalan trendin haberleri
 const PRESS_EMPTY_REFRESH_MS = 12 * HOUR;   // haber bulunamamış arama (çoğu etiket kampanyası) bu kadar sonra yinelenir; bölge aramalarının ~%30'u, İngilizcelerin ~%50'si boş dönüyor
 const ENGLISH_EVERY = 3;                    // haber aramalarının her üçünden biri İngilizce haberlere ayrılır
 const BING_NEWS = 'https://www.bing.com/news/search'; // Google News durunca kalan haber aramaları Bing News'in RSS'inden
-const BING_BUDGET = 100;                    // bir çalışmadaki en çok Bing News isteği
+const BING_BUDGET = 200;                    // bir çalışmadaki en çok Bing News isteği (Actions'tan 100'ü engelsiz geçti, 18 Kas 2026)
 const BING_GAP_MS = 1_500;                  // Bing News istekleri arasındaki en kısa ara
 const TWEETS = 3;                           // haber bulunamayan trend öğesindeki tweet
 const SEARCH_BUDGET = 30;                   // bir çalışmadaki en çok X araması (X'in arama sınırı hesap başına 15 dakikada ~50)
@@ -41,7 +41,7 @@ const REFRESH_MS = 3 * HOUR;                // gündemde kalan trendin tweet'ler
 const RETRY_MS = HOUR;                      // tweet bulunamayan trend bu süre sonra yeniden aranır
 const WINDOW_MS = DAY;                      // haber ve tweet'ler bu kadar yeni olmalı
 const KEEP_MS = DAY;                        // gündemden düşen trend son görülmesinden sonra bu kadar süre beslemede kalır
-const MAX_ITEMS = 40;                       // bölge beslemesindeki en çok öğe
+const MAX_ITEMS = 60;                       // bölge beslemesindeki en çok öğe
 const STORY_KEEP_MS = 3 * DAY;              // X haberi son görülmesinden sonra bu kadar süre kalır
 const STORY_MATCH_MS = 6 * HOUR;            // trend öğesine yalnız bu kadar yakın zamanda görülmüş X haberi bağlanır
 const ENGLISH_NEWS = 'hl=en-US&gl=US&ceid=US:en'; // İngilizce haber araması: Google News'in ABD baskısı
@@ -117,6 +117,9 @@ const squash = s => s.normalize('NFC').toLowerCase().replace(/[#\s_]+/g, '');
 const words = name => name.replace(/^#/, '').replace(/_+/g, ' ').replace(/([\p{Ll}\d])(\p{Lu})/gu, '$1 $2').replace(/(\p{L})(\d)/gu, '$1 $2').replace(/\s+/g, ' ').trim();
 const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const searchUrl = name => `https://x.com/search?q=${encodeURIComponent(name)}&src=trend_click`;
+// Öğe bağlantısı bölgeyi de taşır (X yok sayar): okuyucular (Akış) aynı adresli öğeleri kopya sayıp gizliyor, oysa her bölgenin
+// öğesi kendi haberlerini ve çevirisini taşır.
+const itemUrl = (name, region) => `${searchUrl(name)}&bolge=${region.slug}`;
 const storyUrl = id => `https://x.com/i/trending/${id}`;
 const tweetUrl = t => `https://x.com/${t.user}/status/${t.id}`;
 const number = n => new Intl.NumberFormat('tr-TR').format(n ?? 0);
@@ -439,8 +442,9 @@ function renderTweet(t) {
 
 // Okuyucular özeti description'ın ilk satırlarından çıkardığı için orada önce bağlam, X haberi ve haberler, sıra bilgisi en sonda;
 // tweet'ler yalnız haber yoksa. Okuma sayfası content:encoded'dır: aynı gövde, sıra bilgisi en başta.
-function trendItem(region, seen, { press, tweets, context, story, names, translations, english }) {
+function trendItem(region, seen, { press, tweets, context, story, names, translations, english, episodeFrom }) {
   const name = seen.name, lines = [];
+  let pending = null; // içerik yoksa durum notu: yalnız okuma sayfasında
   if (context) lines.push(`<p><b>${esc(context.category || 'X')}</b>${context.description ? ` — ${esc(context.description)}` : ''}</p>`);
   if (story) {
     lines.push(`<p><b>X'te:</b> <a href="${storyUrl(story.id)}">${esc(story.headline)}</a>${story.postCount ? ` · ${compact(story.postCount)} gönderi` : ''}</p>`);
@@ -453,9 +457,9 @@ function trendItem(region, seen, { press, tweets, context, story, names, transla
   } else {
     const list = shownTweets(tweets, name, names);
     if (list.length) { lines.push(...list.map(renderTweet)); note = ` · tweet'ler ${time(tweets.at)} itibarıyla`; }
-    else if (!press) lines.push('<p>Haberler henüz çekilmedi.</p>');
-    else if (!tweets) lines.push('<p>Son 24 saatte haber yok; tweet\'ler henüz çekilmedi.</p>');
-    else lines.push('<p>Son 24 saatte bu konuda haber de beğeni eşiğini geçen tweet de bulunamadı.</p>');
+    else if (!press) pending = '<p>Haberler henüz çekilmedi.</p>';
+    else if (!tweets) pending = '<p>Son 24 saatte haber yok; tweet\'ler henüz çekilmedi.</p>';
+    else pending = '<p>Son 24 saatte bu konuda haber de beğeni eşiğini geçen tweet de bulunamadı.</p>';
   }
   lines.push(...translationSection(originals(name, press, tweets, names), translations));
   // Arama terimi trendin adından farklıysa (çeviriyle arandıysa) yazılır: eşleşmenin isabeti görülebilsin.
@@ -464,10 +468,15 @@ function trendItem(region, seen, { press, tweets, context, story, names, transla
   if (extra.length) lines.push('<hr>', `<p><b>İngilizce haberler</b>${english.term !== words(name) ? ` · “${esc(english.term)}” araması` : ''}</p>`, pressList(extra));
   const meta = `<p><small>${esc(region.where)} ${seen.rank != null ? `${seen.rank}. sırada · ilk görülme ${time(seen.firstSeen)}`
     : `gündemden düştü · son görülme ${time(seen.lastSeen)}, en iyi sıra ${seen.best}.`}${note} · <a href="${esc(searchUrl(name))}">X'te ara</a></small></p>`;
+  // guid ilk görülme anını da taşır: gündemden düşüp silinen (KEEP_MS) trend yeniden girince yeni öğe olur. episodeFrom'dan önce
+  // ilk görülmüş trendler eski biçimde kalır, okuyucuda aynı öğeler yinelenmez.
+  const guid = `x-gundem:${region.slug}:${keyOf(name)}${seen.firstSeen >= episodeFrom ? `:${seen.firstSeen}` : ''}`;
+  // İçeriği olmayan öğenin özeti boştur: okuyucular özeti gömüp benzer öğeleri kümeliyor; yalnız "henüz çekilmedi" ve sıra satırı
+  // taşıyan özetler bir bölgenin ilgisiz trendlerini aynı olaya topluyordu.
   return {
-    title: `${flagOf(region)} ${name}`, link: searchUrl(name), guid: `x-gundem:${region.slug}:${keyOf(name)}`, date: seen.firstSeen,
+    title: `${flagOf(region)} ${name}`, link: itemUrl(name, region), guid, date: seen.firstSeen,
     categories: [region.name, ...(context?.category ? [context.category] : [])],
-    description: [...lines, meta].join('\n'), content: [meta, ...lines].join('\n'),
+    description: lines.length ? [...lines, meta].join('\n') : '', content: [meta, ...(pending ? [pending] : []), ...lines].join('\n'),
   };
 }
 
@@ -516,6 +525,8 @@ ${rows}
 async function main() {
   const now = Date.now();
   const state = await loadState();
+  // Yeni guid biçiminin (ilk görülme anlı) başladığı an; ilk kez yeni kodla çalışan an olarak bir kez yazılır.
+  state.episodeFrom ??= now;
   if (!hasAuth) console.log('UYARI: X çerezleri yok; tweet, kategori ve X haberi çekilmeyecek.');
 
   // 1. Bölge trend listeleri. Cloudflare Actions'tan gelen bir isteği ara ara reddediyor (403); düşen bölgeler turun sonunda bir kez daha denenir.
@@ -725,7 +736,7 @@ async function main() {
       const story = storyFor(seen.name, state.stories, now);
       if (story) linked++;
       const term = englishTerm(region, seen.name, state.translations), english = term && state.english[term] ? { term, ...state.english[term] } : null;
-      return trendItem(region, seen, { press, tweets, context: state.context[key], story, names, translations: state.translations, english });
+      return trendItem(region, seen, { press, tweets, context: state.context[key], story, names, translations: state.translations, english, episodeFrom: state.episodeFrom });
     });
     const file = `${region.slug}.xml`, title = `${flagOf(region)} ${region.name} - X Gündem`;
     await writeFile(join(outDir, file), render({ file, title, link: `${TRENDS24}${region.path}`,
