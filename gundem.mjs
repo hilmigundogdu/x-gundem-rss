@@ -26,9 +26,10 @@ const GNEWS = 'https://news.google.com/rss/search';
 const HOUR = 60 * 60 * 1000, DAY = 24 * HOUR;
 const TOP = 10;                             // bölge başına beslemeye giren trend
 const PRESS_ITEMS = 3;                      // trend öğesindeki haber
-const PRESS_BUDGET = 140;                   // bir çalışmadaki en çok Google News isteği; Actions'tan ~150'de 429 geliyor (2026-11-18)
+const PRESS_BUDGET = 140;                   // bir çalışmadaki en çok Google News isteği; Actions'tan 429 kimi çalışmada ~150'de, kimisinde ilk 2-40 istekte geliyor (2026-11-18)
 const PRESS_GAP_MS = 1_000;                 // Google News istekleri arasındaki en kısa ara
-const PRESS_REFRESH_MS = 2 * HOUR;          // gündemde kalan trendin haberleri en çok bu sıklıkla yenilenir
+const PRESS_REFRESH_MS = 4 * HOUR;          // gündemde kalan trendin haberleri (bölge ve İngilizce) en çok bu sıklıkla yenilenir; 2 saatte istek Google News'in kaldırdığından fazlaydı
+const ENGLISH_EVERY = 3;                    // Google News isteklerinin her üçünden biri İngilizce haberlere ayrılır
 const TWEETS = 3;                           // haber bulunamayan trend öğesindeki tweet
 const SEARCH_BUDGET = 30;                   // bir çalışmadaki en çok X araması (X'in arama sınırı hesap başına 15 dakikada ~50)
 const SEARCH_GAP_MS = 2_000;                // aramalar arasındaki en kısa ara
@@ -549,26 +550,13 @@ async function main() {
   }
   if (dropped) console.log(`Trend sörfü: saklı ${dropped} tweet çıkarıldı; o trendler yeniden aranacak.`);
 
-  // 2. Haberler: önce hiç çekilmemiş trendler (iyi sıradan başlayarak), sonra yenilenmesi gelenler.
+  // 2. Haberler: bölgenin kendi haberleri ve İngilizce haberler aynı bütçeden, iç içe: her ENGLISH_EVERY istekten biri İngilizce
+  // (bölge haberi kalmadıysa hepsi). Google News Actions'tan bazen ilk birkaç istekte 429 verdiği için İngilizce haberler bölgenin
+  // haberlerinin ardına kalınca hiç sıra gelmiyordu. Her kolda önce hiç çekilmemişler (iyi sıradan başlayarak), sonra yenilenmesi
+  // gelenler. Bölgeler arasında ortak İngilizce terim bir kez aranır.
   const pressDue = regions.flatMap(region => (current.get(region.slug) ?? []).map((name, i) => ({ region, name, rank: i + 1, id: `${region.slug}:${keyOf(name)}` })))
     .filter(({ id }) => !state.press[id] || now - state.press[id].at >= PRESS_REFRESH_MS)
     .sort((a, b) => Number(Boolean(state.press[a.id])) - Number(Boolean(state.press[b.id])) || a.rank - b.rank);
-  const pressQueue = limiter(pressBudget, PRESS_GAP_MS);
-  let pressDone = 0, pressFound = 0, pressStopped = false;
-  for (const { region, name, id } of pressDue) {
-    try {
-      const list = await pressQueue.run(() => fetchPress(words(name), region.news));
-      state.press[id] = { at: Date.now(), list };
-      pressDone++; if (list.length) pressFound++;
-    } catch (e) {
-      if (e.budget) { pressStopped = true; break; }
-      console.log(`"${name}" (${region.name}) haberleri alınamadı: ${e.message}`);
-      if (e.stop) { console.log('Google News istekleri sonraki çalışmaya kaldı.'); pressStopped = true; break; }
-    }
-  }
-  console.log(`Haber: ${pressDone}/${pressDue.length} trend güncellendi, ${pressFound} trendde haber var, ${pressQueue.used}/${pressBudget} istek.`);
-
-  // İngilizce haberler, bölgenin kendi haberlerinden sonra aynı bütçeyle. Bölgeler arasında ortak terim bir kez aranır.
   const englishWant = new Map();
   for (const region of regions) (current.get(region.slug) ?? []).forEach((name, i) => {
     const term = englishTerm(region, name, state.translations), had = englishWant.get(term);
@@ -576,20 +564,28 @@ async function main() {
   });
   const englishDue = [...englishWant].filter(([term]) => !state.english[term] || now - state.english[term].at >= PRESS_REFRESH_MS)
     .sort(([a, ra], [b, rb]) => Number(Boolean(state.english[a])) - Number(Boolean(state.english[b])) || ra - rb);
-  let englishDone = 0, englishFound = 0;
-  const englishStart = pressQueue.used;
-  if (!pressStopped) for (const [term] of englishDue) {
+  const tally = { press: { done: 0, found: 0, calls: 0 }, english: { done: 0, found: 0, calls: 0 } };
+  const pressJobs = pressDue.map(({ region, name, id }) => ({ term: words(name), news: region.news, box: state.press, key: id,
+    t: tally.press, label: `"${name}" (${region.name}) haberleri` }));
+  const englishJobs = englishDue.map(([term]) => ({ term, news: ENGLISH_NEWS, box: state.english, key: term,
+    t: tally.english, label: `"${term}" İngilizce haberleri` }));
+  const pressQueue = limiter(pressBudget, PRESS_GAP_MS);
+  while (pressJobs.length || englishJobs.length) {
+    const englishTurn = !pressJobs.length || pressQueue.used % ENGLISH_EVERY === ENGLISH_EVERY - 1;
+    const job = (englishTurn && englishJobs.length ? englishJobs : pressJobs).shift();
     try {
-      const list = await pressQueue.run(() => fetchPress(term, ENGLISH_NEWS));
-      state.english[term] = { at: Date.now(), list };
-      englishDone++; if (list.length) englishFound++;
+      const list = await pressQueue.run(() => { job.t.calls++; return fetchPress(job.term, job.news); });
+      job.box[job.key] = { at: Date.now(), list };
+      job.t.done++; if (list.length) job.t.found++;
     } catch (e) {
       if (e.budget) break;
-      console.log(`"${term}" İngilizce haberleri alınamadı: ${e.message}`);
-      if (e.stop) { console.log('İngilizce haber aramaları sonraki çalışmaya kaldı.'); break; }
+      console.log(`${job.label} alınamadı: ${e.message}`);
+      if (e.stop) { console.log('Google News istekleri sonraki çalışmaya kaldı.'); break; }
     }
   }
-  console.log(`İngilizce haber: ${englishDone}/${englishDue.length} terim güncellendi, ${englishFound} terimde haber var, ${pressQueue.used - englishStart} istek.`);
+  console.log(`Haber: ${tally.press.done}/${pressDue.length} trend güncellendi, ${tally.press.found} trendde haber var, ${tally.press.calls} istek.`);
+  console.log(`İngilizce haber: ${tally.english.done}/${englishDue.length} terim güncellendi, ${tally.english.found} terimde haber var, ${tally.english.calls} istek.`);
+  console.log(`Google News: ${pressQueue.used}/${pressBudget} istek.`);
 
   if (hasAuth) {
     // 3. X'in Keşfet sekmeleri: trend kategorileri ve X'in habere çevirdiği konular.
