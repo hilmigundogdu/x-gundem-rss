@@ -26,7 +26,7 @@ const GNEWS = 'https://news.google.com/rss/search';
 const HOUR = 60 * 60 * 1000, DAY = 24 * HOUR;
 const TOP = 10;                             // bölge başına beslemeye giren trend
 const PRESS_ITEMS = 3;                      // trend öğesindeki haber
-const PRESS_BUDGET = 200;                   // bir çalışmadaki en çok Google News isteği (29 bölge × 10 trend, yerel ve İngilizce, 2 saatte bir)
+const PRESS_BUDGET = 140;                   // bir çalışmadaki en çok Google News isteği; Actions'tan ~150'de 429 geliyor (2026-11-18)
 const PRESS_GAP_MS = 1_000;                 // Google News istekleri arasındaki en kısa ara
 const PRESS_REFRESH_MS = 2 * HOUR;          // gündemde kalan trendin haberleri en çok bu sıklıkla yenilenir
 const TWEETS = 3;                           // haber bulunamayan trend öğesindeki tweet
