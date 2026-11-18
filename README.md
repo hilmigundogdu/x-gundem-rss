@@ -24,7 +24,7 @@ X'te "Avrupa" diye bir trend bölgesi yok; Avrupa ülke ülke verilir.
   - X trendi habere çevirdiyse o haberin sayfası (`x.com/i/trending/<id>`; Grok özeti ve gönderiler orada) ve görseli,
   - o ülkenin dilinde son 24 saatin 3 haberi (başlık, yayın, saat),
   - haber yoksa en beğenilen 3 tweet (metin, görsel ya da video kapağı, alıntı, yazar, beğeni, RT, tarih),
-  - en sonda sıra ve ilk görülme anı.
+  - sıra ve ilk görülme anı: okuma sayfasında (`content:encoded`) en başta, özette (`description`) en sonda.
 - Gündemden düşen trend 24 saat daha beslemede kalır, içinde "gündemden düştü" yazar. Beslemede en çok 40 öğe olur.
 - **X haberi** (`haberler.xml`): X'in Keşfet sekmelerinde (Sana özel, Gündem, Haberler, Spor, Eğlence) habere çevirdiği konular; kategori, gönderi sayısı, görsel ve X'teki sayfasının bağlantısı. Oturum hesabının konumuna göre gelir.
 

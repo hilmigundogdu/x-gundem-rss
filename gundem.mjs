@@ -292,7 +292,8 @@ function renderTweet(t) {
     + `<a href="${esc(tweetUrl(t))}">${t.at ? time(t.at) : 'tweet'}</a></p>`;
 }
 
-// Okuyucular özeti ilk satırlardan çıkardığı için önce bağlam, X haberi ve haberler; tweet'ler yalnız haber yoksa; sıra bilgisi en sonda.
+// Okuyucular özeti description'ın ilk satırlarından çıkardığı için orada önce bağlam, X haberi ve haberler, sıra bilgisi en sonda;
+// tweet'ler yalnız haber yoksa. Okuma sayfası content:encoded'dır: aynı gövde, sıra bilgisi en başta.
 function trendItem(region, seen, { press, tweets, context, story, names }) {
   const name = seen.name, lines = [];
   if (context) lines.push(`<p><b>${esc(context.category || 'X')}</b>${context.description ? ` — ${esc(context.description)}` : ''}</p>`);
@@ -311,11 +312,12 @@ function trendItem(region, seen, { press, tweets, context, story, names }) {
     else if (!tweets) lines.push('<p>Son 24 saatte haber yok; tweet\'ler henüz çekilmedi.</p>');
     else lines.push('<p>Son 24 saatte bu konuda haber de beğeni eşiğini geçen tweet de bulunamadı.</p>');
   }
-  lines.push(`<p><small>${esc(region.where)} ${seen.rank != null ? `${seen.rank}. sırada · ilk görülme ${time(seen.firstSeen)}`
-    : `gündemden düştü · son görülme ${time(seen.lastSeen)}, en iyi sıra ${seen.best}.`}${note} · <a href="${esc(searchUrl(name))}">X'te ara</a></small></p>`);
+  const meta = `<p><small>${esc(region.where)} ${seen.rank != null ? `${seen.rank}. sırada · ilk görülme ${time(seen.firstSeen)}`
+    : `gündemden düştü · son görülme ${time(seen.lastSeen)}, en iyi sıra ${seen.best}.`}${note} · <a href="${esc(searchUrl(name))}">X'te ara</a></small></p>`;
   return {
     title: name, link: searchUrl(name), guid: `x-gundem:${region.slug}:${keyOf(name)}`, date: seen.firstSeen,
-    categories: [region.name, ...(context?.category ? [context.category] : [])], description: lines.join('\n'),
+    categories: [region.name, ...(context?.category ? [context.category] : [])],
+    description: [...lines, meta].join('\n'), content: [meta, ...lines].join('\n'),
   };
 }
 
@@ -323,7 +325,7 @@ function render(channel, items, now) {
   const date = ms => new Date(ms).toUTCString();
   const lines = [
     '<?xml version="1.0" encoding="UTF-8"?>',
-    '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">',
+    '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/">',
     '<channel>',
     `<title>${esc(channel.title)}</title>`,
     `<link>${esc(channel.link)}</link>`,
@@ -342,6 +344,7 @@ function render(channel, items, now) {
       `<pubDate>${date(item.date)}</pubDate>`,
       ...item.categories.map(c => `<category>${esc(c)}</category>`),
       `<description>${cdata(item.description)}</description>`,
+      ...(item.content ? [`<content:encoded>${cdata(item.content)}</content:encoded>`] : []),
       '</item>');
   }
   lines.push('</channel>', '</rss>', '');
