@@ -3,9 +3,10 @@
 // haberleri vardır; haber bulunamayan trendde (çoğunlukla etiket kampanyaları) en beğenilen tweet'ler gösterilir.
 // Trend listesi trends24.in'den (X'in bölge trendlerini saatlik yayımlar; kimlik istemez), haberler Google News'in arama RSS'inden
 // gelir. Tweet'ler, X'in haber sayfaları (haberler.xml) ve trend kategorileri bird CLI'yla (@steipete/bird, X'in web GraphQL'i,
-// oturum çerezi) çekilir.
+// oturum çerezi) çekilir. İngilizce ve Türkçe dışındaki trend adı, başlık ve tweet'lerin İngilizce ve Türkçe çevirisi öğenin
+// sonuna eklenir (Google Translate'in anahtarsız ucu; X'in "çevir" düğmesi de Google çevirisi gösterir).
 //
-// Ortam:  BASE_URL     yayımlanmış sitenin adresi; önceki durum BASE_URL/state.json'dan okunur (ilk görülme anları, haberler, tweet'ler).
+// Ortam:  BASE_URL     yayımlanmış sitenin adresi; önceki durum BASE_URL/state.json'dan okunur (ilk görülme anları, haberler, tweet'ler, çeviriler).
 //         OUT_DIR      çıktı klasörü (varsayılan: public).
 //         AUTH_TOKEN, CT0   X oturum çerezleri (bird okur; yerelde BIRD_AUTH_TOKEN ve BIRD_CT0 de olur). Yoksa tweet, kategori ve
 //                      X haberi çekilmez; trend listeleri ve Google News haberleri yine yayımlanır.
@@ -38,6 +39,9 @@ const KEEP_MS = DAY;                        // gündemden düşen trend son gör
 const MAX_ITEMS = 40;                       // bölge beslemesindeki en çok öğe
 const STORY_KEEP_MS = 3 * DAY;              // X haberi son görülmesinden sonra bu kadar süre kalır
 const STORY_MATCH_MS = 6 * HOUR;            // trend öğesine yalnız bu kadar yakın zamanda görülmüş X haberi bağlanır
+const TRANSLATE = 'https://translate.googleapis.com/translate_a/t';
+const TRANSLATE_BATCH = 40, TRANSLATE_CHARS = 4_000; // bir çeviri isteğindeki en çok metin ve karakter
+const TRANSLATE_GAP_MS = 1_000;             // çeviri istekleri arasındaki en kısa ara
 const FETCH_TIMEOUT_MS = 30_000;
 const BIRD_TIMEOUT_MS = 90_000;
 
@@ -93,6 +97,9 @@ function time(ms) {
   return `${p.day}.${p.month} ${p.hour}:${p.minute}`;
 }
 const firstLine = s => String(s).trim().split('\n').find(Boolean)?.slice(0, 300) ?? '';
+const LANG_NAMES = new Intl.DisplayNames(['tr'], { type: 'language' });
+const langName = code => { try { return LANG_NAMES.of(code); } catch { return code; } };
+const sameText = (a, b) => a.normalize('NFC').toLowerCase().replace(/\s+/g, ' ').trim() === b.normalize('NFC').toLowerCase().replace(/\s+/g, ' ').trim();
 
 async function get(url) {
   const res = await fetch(url, { headers: { 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
@@ -134,9 +141,10 @@ function limiter(max, gap) {
 }
 
 // ---- Durum: önceki çalışmanın state.json'u; ilk görülme anlarını, haberleri ve tweet'leri taşır.
-// regions[slug].trends[anahtar], press["slug:anahtar"], tweets[anahtar], context[anahtar], stories[id] (X haberleri).
+// regions[slug].trends[anahtar], press["slug:anahtar"], tweets[anahtar], context[anahtar], stories[id] (X haberleri),
+// translations[özgün metin] = { lang, en, tr } (çeviri gerekmiyorsa en ve tr null).
 
-const emptyState = () => ({ version: 2, regions: {}, press: {}, tweets: {}, context: {}, stories: {} });
+const emptyState = () => ({ version: 2, regions: {}, press: {}, tweets: {}, context: {}, stories: {}, translations: {} });
 
 async function loadState() {
   let raw;
@@ -176,6 +184,45 @@ async function fetchTrends(region) {
   const res = await get(TRENDS24 + region.path);
   if (!res.ok) throw new Error(`trends24 HTTP ${res.status}`);
   return parseTrends24(res.body);
+}
+
+// ---- Çeviri: Google Translate'in anahtarsız ucu birden çok metni bir istekte çevirir, her metnin dilini ayrı tespit eder
+// ([[çeviri, dil], …]); çok satırlı metin satırlarını korur.
+
+async function translate(texts, target) {
+  const body = new URLSearchParams(texts.map(q => ['q', q]));
+  const res = await fetch(`${TRANSLATE}?client=gtx&sl=auto&tl=${target}`, {
+    method: 'POST', body, headers: { 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`Google Translate HTTP ${res.status}`);
+  const data = await res.json();
+  const list = texts.length === 1 && typeof data?.[0] === 'string' ? [data] : data;
+  if (!Array.isArray(list) || list.length !== texts.length) throw new Error('Google Translate yanıtı beklenen biçimde değil.');
+  return list.map(([text, lang]) => ({ text: String(text ?? ''), lang: String(lang ?? '') }));
+}
+
+// Önce İngilizceye çevrilir: dil İngilizce ya da Türkçeyse, belirlenemediyse ya da çeviri özgünün aynısıysa (özel ad) çeviri
+// gerekmez. Kalanlar Türkçeye çevrilir.
+async function translateAll(texts, cache, queue) {
+  const chunks = [];
+  for (const text of texts) {
+    const last = chunks.at(-1);
+    if (last && last.length < TRANSLATE_BATCH && last.reduce((n, t) => n + t.length, text.length) <= TRANSLATE_CHARS) last.push(text);
+    else chunks.push([text]);
+  }
+  let done = 0;
+  for (const chunk of chunks) {
+    const en = await queue.run(() => translate(chunk, 'en'));
+    const foreign = chunk.filter((text, i) => en[i].lang && !['en', 'tr', 'auto', 'und'].includes(en[i].lang) && !sameText(en[i].text, text));
+    const tr = foreign.length ? await queue.run(() => translate(foreign, 'tr')) : [];
+    chunk.forEach((text, i) => {
+      const at = foreign.indexOf(text), trText = at >= 0 ? tr[at].text : null;
+      cache[text] = at < 0 ? { lang: en[i].lang, en: null, tr: null }
+        : { lang: en[i].lang, en: en[i].text, tr: trText && !sameText(trText, text) ? trText : null };
+    });
+    done += chunk.length;
+  }
+  return done;
 }
 
 // ---- Haberler: Google News'in arama RSS'i, bölgenin ülkesi ve diliyle, son 24 saat. Etiket okunur biçimiyle aranır.
@@ -282,8 +329,33 @@ function storyFor(name, stories, now) {
 
 // ---- RSS
 
+const prose = text => esc(text).replace(/https?:\/\/[^\s<]+/g, u => `<a href="${u}">${u}</a>`).replace(/\n/g, '<br>');
+
+// Haberi olmayan trend öğesinde gösterilen tweet'ler: bu çalışmanın trend listesiyle trend sörfüne karşı süzülür.
+const shownTweets = (tweets, name, names) => (tweets?.list ?? []).filter(t => !trendSurfing(t.text, name, names, tweets.siblings)).slice(0, TWEETS);
+
+// Öğede çevrilecek metinler: trend adı (etiketse okunur biçimi), haber başlıkları ya da tweet'ler ve alıntıladıkları.
+function originals(name, press, tweets, names) {
+  const list = [{ label: 'Trend', text: words(name) }];
+  if (press?.list.length) list.push(...press.list.map(n => ({ label: n.source || 'Haber', text: n.title })));
+  else for (const t of shownTweets(tweets, name, names)) {
+    list.push({ label: `@${t.user}`, text: t.text });
+    if (t.quoted?.text) list.push({ label: `@${t.quoted.user} (alıntı)`, text: t.quoted.text });
+  }
+  return list.filter(o => o.text.trim());
+}
+
+// Özgün metinler yerinde kalır; çeviriler ayırıcının altında ayrı bölümdür, öğedeki sırayla.
+function translationSection(list, translations) {
+  const rows = list.map(o => ({ ...o, t: translations[o.text] })).filter(o => o.t?.en || o.t?.tr);
+  if (!rows.length) return [];
+  const langs = [...new Set(rows.map(o => langName(o.t.lang)))].join(', ');
+  return ['<hr>', `<p><b>Çeviri</b> · ${esc(langs)}</p>`, ...rows.map(o => `<p><b>${esc(o.label)}</b>`
+    + `${o.t.en ? `<br><b>EN</b> ${prose(o.t.en)}` : ''}${o.t.tr ? `<br><b>TR</b> ${prose(o.t.tr)}` : ''}</p>`)];
+}
+
 function renderTweet(t) {
-  const body = esc(t.text).replace(/https?:\/\/[^\s<]+/g, u => `<a href="${u}">${u}</a>`).replace(/\n/g, '<br>');
+  const body = prose(t.text);
   const media = t.media.map(m => `<p><a href="${esc(tweetUrl(t))}"><img src="${esc(m.url)}" alt="${m.type === 'photo' ? '' : 'video'}"></a></p>`).join('');
   const quoted = t.quoted ? `<blockquote><p><b>${esc(t.quoted.name)}</b> (@${esc(t.quoted.user)})<br>${esc(t.quoted.text).replace(/\n/g, '<br>')}</p></blockquote>` : '';
   const video = t.media.some(m => m.video) ? ' · ▶ video' : '';
@@ -294,7 +366,7 @@ function renderTweet(t) {
 
 // Okuyucular özeti description'ın ilk satırlarından çıkardığı için orada önce bağlam, X haberi ve haberler, sıra bilgisi en sonda;
 // tweet'ler yalnız haber yoksa. Okuma sayfası content:encoded'dır: aynı gövde, sıra bilgisi en başta.
-function trendItem(region, seen, { press, tweets, context, story, names }) {
+function trendItem(region, seen, { press, tweets, context, story, names, translations }) {
   const name = seen.name, lines = [];
   if (context) lines.push(`<p><b>${esc(context.category || 'X')}</b>${context.description ? ` — ${esc(context.description)}` : ''}</p>`);
   if (story) {
@@ -306,12 +378,13 @@ function trendItem(region, seen, { press, tweets, context, story, names }) {
     lines.push(`<ul>\n${press.list.map(n => `<li><a href="${esc(n.url)}">${esc(n.title)}</a> — ${esc(n.source || 'haber')}${n.at ? ` · ${time(n.at)}` : ''}</li>`).join('\n')}\n</ul>`);
     note = ` · haberler ${time(press.at)} itibarıyla`;
   } else {
-    const list = (tweets?.list ?? []).filter(t => !trendSurfing(t.text, name, names, tweets.siblings)).slice(0, TWEETS);
+    const list = shownTweets(tweets, name, names);
     if (list.length) { lines.push(...list.map(renderTweet)); note = ` · tweet'ler ${time(tweets.at)} itibarıyla`; }
     else if (!press) lines.push('<p>Haberler henüz çekilmedi.</p>');
     else if (!tweets) lines.push('<p>Son 24 saatte haber yok; tweet\'ler henüz çekilmedi.</p>');
     else lines.push('<p>Son 24 saatte bu konuda haber de beğeni eşiğini geçen tweet de bulunamadı.</p>');
   }
+  lines.push(...translationSection(originals(name, press, tweets, names), translations));
   const meta = `<p><small>${esc(region.where)} ${seen.rank != null ? `${seen.rank}. sırada · ilk görülme ${time(seen.firstSeen)}`
     : `gündemden düştü · son görülme ${time(seen.lastSeen)}, en iyi sıra ${seen.best}.`}${note} · <a href="${esc(searchUrl(name))}">X'te ara</a></small></p>`;
   return {
@@ -506,21 +579,45 @@ async function main() {
   for (const [key, c] of Object.entries(state.context)) if (!liveKeys.has(key) && now - c.at > KEEP_MS) delete state.context[key];
   for (const [id, s] of Object.entries(state.stories)) if (now - s.lastSeen > STORY_KEEP_MS) delete state.stories[id];
 
-  // 5. Yazma.
+  // Beslemeye girecek öğeler: gündemdekiler sırayla, sonra düşenler.
+  const listed = region => Object.entries(state.regions[region.slug]?.trends ?? {})
+    .sort(([, a], [, b]) => (a.rank ?? Infinity) - (b.rank ?? Infinity) || b.lastSeen - a.lastSeen)
+    .slice(0, MAX_ITEMS)
+    .map(([key, seen]) => ({ key, seen, press: state.press[`${region.slug}:${key}`], tweets: state.tweets[key] }));
+
+  // 5. Çeviri: İngilizce ve Türkçe bölgeler dışında, gündemdeki trendlerden başlayarak. Çevrilen metin saklanır, bir kez çevrilir.
+  const wanted = new Set(), todo = [];
+  for (const pass of ['live', 'dropped']) for (const region of REGIONS) {
+    if (region.lang === 'en' || region.lang === 'tr') continue;
+    for (const { seen, press, tweets } of listed(region)) {
+      if ((seen.rank != null) !== (pass === 'live')) continue;
+      for (const { text } of originals(seen.name, press, tweets, names)) {
+        if (wanted.has(text)) continue;
+        wanted.add(text);
+        if (!state.translations[text]) todo.push(text);
+      }
+    }
+  }
+  for (const text of Object.keys(state.translations)) if (!wanted.has(text)) delete state.translations[text];
+  if (todo.length) {
+    const queue = limiter(Infinity, TRANSLATE_GAP_MS);
+    let done = 0;
+    try { done = await translateAll(todo, state.translations, queue); }
+    catch (e) { done = todo.filter(text => state.translations[text]).length; console.log(`Çeviri yarıda kaldı: ${e.message}`); }
+    console.log(`Çeviri: ${done}/${todo.length} metin, ${queue.used} istek.`);
+  }
+
+  // 6. Yazma.
   await mkdir(outDir, { recursive: true });
   const files = [];
   let linked = 0;
   for (const region of REGIONS) {
-    const trends = state.regions[region.slug]?.trends;
-    if (!trends) continue;
-    const items = Object.entries(trends)
-      .sort(([, a], [, b]) => (a.rank ?? Infinity) - (b.rank ?? Infinity) || b.lastSeen - a.lastSeen)
-      .slice(0, MAX_ITEMS)
-      .map(([key, seen]) => {
-        const story = storyFor(seen.name, state.stories, now);
-        if (story) linked++;
-        return trendItem(region, seen, { press: state.press[`${region.slug}:${key}`], tweets: state.tweets[key], context: state.context[key], story, names });
-      });
+    if (!state.regions[region.slug]) continue;
+    const items = listed(region).map(({ key, seen, press, tweets }) => {
+      const story = storyFor(seen.name, state.stories, now);
+      if (story) linked++;
+      return trendItem(region, seen, { press, tweets, context: state.context[key], story, names, translations: state.translations });
+    });
     const file = `${region.slug}.xml`, title = `X Trend · ${region.name}`;
     await writeFile(join(outDir, file), render({ file, title, link: `${TRENDS24}${region.path}`,
       description: `${region.where} X trendleri (trends24.in), son 24 saatin haberleriyle.` }, items, now));
